@@ -279,12 +279,16 @@ def main():
             print("ERROR: MCP_SERVER_URL must be set in SSE mode (e.g. https://your-app.railway.app)", file=sys.stderr)
             sys.exit(1)
 
-        # Start with empty map — auth runs in background after server is up
+        # Pre-populate all known API keys so OAuth flow works immediately at startup.
+        # Garmin clients are added to client_map as background auth completes.
         client_map: dict[str, Garmin] = {}
+        if users:
+            known_keys = {u["key"] for u in users}
+        else:
+            known_keys = {k.strip() for k in os.environ.get("MCP_API_KEYS", "default-key").split(",") if k.strip()}
 
-        # Build OAuth provider with empty keys — populated by background auth thread
         oauth_provider = GarminOAuthProvider(
-            api_keys=set(),
+            api_keys=known_keys,
             server_url=server_url,
         )
 
@@ -306,21 +310,19 @@ def main():
                             any_failed = True
                             continue
                         client_map[u["key"]] = client
-                        oauth_provider._api_keys.add(u["key"])
                         print(f"  ✓ {name} ({u.get('email', 'no email')})", file=sys.stderr)
                     if any_failed:
                         print("Auth incomplete — retrying in 60 minutes.", file=sys.stderr)
                         time.sleep(RETRY_INTERVAL)
             else:
+                single_key = next(iter(known_keys))
                 single_email = os.environ.get("GARMIN_EMAIL")
                 single_password = os.environ.get("GARMIN_PASSWORD")
-                single_key = os.environ.get("MCP_API_KEYS", "default-key").split(",")[0].strip()
                 while single_key not in client_map:
                     print("Background auth: single-user mode...", file=sys.stderr)
                     client = init_api(single_email, single_password)
                     if client:
                         client_map[single_key] = client
-                        oauth_provider._api_keys.add(single_key)
                         print(f"Single-user authenticated. API key: {single_key}", file=sys.stderr)
                     else:
                         print("Auth failed — retrying in 60 minutes.", file=sys.stderr)
