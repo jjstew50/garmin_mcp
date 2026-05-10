@@ -39,5 +39,5 @@ EXPOSE 8000
 ENTRYPOINT ["garmin-mcp"]
 
 # Health check for hosted deployments (MCP_TRANSPORT=sse)
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD curl -f http://localhost:${PORT:-8000}/health || exit 1
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:${PORT:-8000}/health')" || exit 1
