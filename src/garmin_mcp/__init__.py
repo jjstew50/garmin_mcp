@@ -76,18 +76,26 @@ def get_mfa() -> str:
     return input("Enter MFA code: ")
 
 
+def _user_tokenstore(base: str, email: str | None) -> str:
+    """Return a per-user subdirectory under base, keyed by email."""
+    if not email:
+        return os.path.expanduser(base)
+    safe = email.replace("@", "_").replace(".", "_")
+    return os.path.join(os.path.expanduser(base), safe)
+
+
 def init_api(email: str | None, password: str | None, tokens_b64: str | None = None) -> Garmin | None:
     """Initialize a Garmin client for one user.
 
     Priority:
       1. tokens_b64 argument (passed in from MCP_USERS config)
       2. GARMINTOKENS_BASE64_CONTENT env var (single-user hosted mode)
-      3. Token files on disk (GARMINTOKENS path)
+      3. Token files on disk (per-user subdirectory under GARMINTOKENS path)
       4. email + password re-auth (falls back when tokens missing/expired)
     """
     is_cn = os.getenv("GARMIN_IS_CN", "false").lower() in ("true", "1", "yes")
-    tokenstore = os.getenv("GARMINTOKENS") or "~/.garminconnect"
-    tokenstore_base64 = os.getenv("GARMINTOKENS_BASE64") or "~/.garminconnect_base64"
+    tokenstore_base = os.getenv("GARMINTOKENS") or "~/.garminconnect"
+    tokenstore = _user_tokenstore(tokenstore_base, email)
 
     # 1. Inline base64 tokens (per-user from MCP_USERS, or single-user env var)
     b64 = tokens_b64 or os.getenv("GARMINTOKENS_BASE64_CONTENT")
@@ -96,12 +104,15 @@ def init_api(email: str | None, password: str | None, tokens_b64: str | None = N
             print(f"Trying to login via base64 tokens (email={email})...", file=sys.stderr)
             garmin = Garmin(is_cn=is_cn)
             garmin.garth.loads(b64.strip())
+            # Persist to per-user dir so future restarts skip re-auth
+            os.makedirs(tokenstore, exist_ok=True)
+            garmin.garth.dump(tokenstore)
             print("Login successful via base64 tokens.", file=sys.stderr)
             return garmin
         except Exception as e:
             print(f"Base64 token load failed ({e}), falling back to file/credential auth.", file=sys.stderr)
 
-    # 2. Token files on disk
+    # 2. Token files on disk (per-user directory)
     try:
         print(f"Trying token files in '{tokenstore}' (email={email})...", file=sys.stderr)
         old_stderr = sys.stderr
@@ -130,12 +141,9 @@ def init_api(email: str | None, password: str | None, tokens_b64: str | None = N
     try:
         garmin = Garmin(email=email, password=password, is_cn=is_cn, prompt_mfa=get_mfa)
         garmin.login()
+        os.makedirs(tokenstore, exist_ok=True)
         garmin.garth.dump(tokenstore)
-        token_base64 = garmin.garth.dumps()
-        dir_path = os.path.expanduser(tokenstore_base64)
-        with open(dir_path, "w") as f:
-            f.write(token_base64)
-        print(f"Tokens saved to '{tokenstore}' and '{dir_path}'.", file=sys.stderr)
+        print(f"Tokens saved to '{tokenstore}'.", file=sys.stderr)
         return garmin
     except (FileNotFoundError, GarthHTTPError, GarminConnectAuthenticationError, requests.exceptions.HTTPError) as err:
         error_msg = str(err)
@@ -271,40 +279,44 @@ def main():
             print("ERROR: MCP_SERVER_URL must be set in SSE mode (e.g. https://your-app.railway.app)", file=sys.stderr)
             sys.exit(1)
 
-        if users:
-            # --- Multi-user mode ---
-            print(f"Multi-user mode: initializing {len(users)} user(s)...", file=sys.stderr)
-            client_map: dict[str, Garmin] = {}
-            for u in users:
-                name = u.get("name", u["key"])
-                client = init_api(u.get("email"), u.get("password"), u.get("tokens_b64"))
-                if client is None:
-                    print(f"WARNING: Could not authenticate user '{name}' — skipping.", file=sys.stderr)
-                    continue
-                client_map[u["key"]] = client
-                print(f"  ✓ {name} ({u.get('email', 'no email')})", file=sys.stderr)
+        # Start with empty map — auth runs in background after server is up
+        client_map: dict[str, Garmin] = {}
 
-            if not client_map:
-                print("ERROR: No users authenticated. Exiting.", file=sys.stderr)
-                sys.exit(1)
-
-        else:
-            # --- Single-user mode (backward compatible) ---
-            single_email = os.environ.get("GARMIN_EMAIL")
-            single_password = os.environ.get("GARMIN_PASSWORD")
-            single_key = os.environ.get("MCP_API_KEYS", "default-key").split(",")[0].strip()
-            garmin_client = init_api(single_email, single_password)
-            if not garmin_client:
-                print("Failed to initialize Garmin Connect client. Exiting.", file=sys.stderr)
-                sys.exit(1)
-            client_map = {single_key: garmin_client}
-            print(f"Single-user mode. API key: {single_key}", file=sys.stderr)
-
-        # Build OAuth provider (shared across both modes)
+        # Build OAuth provider with empty keys — populated by background auth thread
         oauth_provider = GarminOAuthProvider(
-            api_keys=set(client_map.keys()),
+            api_keys=set(),
             server_url=server_url,
         )
+
+        def _background_auth():
+            if users:
+                print(f"Background auth: initializing {len(users)} user(s)...", file=sys.stderr)
+                for u in users:
+                    name = u.get("name", u["key"])
+                    client = init_api(u.get("email"), u.get("password"), u.get("tokens_b64"))
+                    if client is None:
+                        print(f"  ✗ {name} — authentication failed.", file=sys.stderr)
+                        continue
+                    client_map[u["key"]] = client
+                    oauth_provider._api_keys.add(u["key"])
+                    print(f"  ✓ {name} ({u.get('email', 'no email')})", file=sys.stderr)
+                if not client_map:
+                    print("WARNING: No users authenticated. MCP calls will fail until auth succeeds.", file=sys.stderr)
+            else:
+                single_email = os.environ.get("GARMIN_EMAIL")
+                single_password = os.environ.get("GARMIN_PASSWORD")
+                single_key = os.environ.get("MCP_API_KEYS", "default-key").split(",")[0].strip()
+                print("Background auth: single-user mode...", file=sys.stderr)
+                client = init_api(single_email, single_password)
+                if client:
+                    client_map[single_key] = client
+                    oauth_provider._api_keys.add(single_key)
+                    print(f"Single-user authenticated. API key: {single_key}", file=sys.stderr)
+                else:
+                    print("WARNING: Authentication failed. MCP calls will fail until auth succeeds.", file=sys.stderr)
+
+        import threading
+        threading.Thread(target=_background_auth, daemon=True).start()
 
         auth_settings = AuthSettings(
             issuer_url=server_url,  # type: ignore[arg-type]
@@ -330,9 +342,11 @@ def main():
         asgi_app = _build_user_router(client_map, mcp_starlette)
 
         port = int(os.environ.get("PORT", 8000))
-        config = uvicorn.Config(asgi_app, host="0.0.0.0", port=port, log_level="info")
+        config = uvicorn.Config(
+            asgi_app, host="0.0.0.0", port=port, log_level="info", http="h11"
+        )
         server = uvicorn.Server(config)
-        print(f"Starting SSE server on :{port}  →  connect at /sse?key=YOUR_KEY", file=sys.stderr)
+        print(f"Starting SSE server on :{port}", file=sys.stderr)
         anyio.run(server.serve)
 
     else:
