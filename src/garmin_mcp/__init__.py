@@ -349,6 +349,23 @@ def main():
         async def health_check(request: Request) -> Response:
             return PlainTextResponse("ok")
 
+        @app.custom_route("/status", methods=["GET"])
+        async def auth_status(request: Request) -> Response:
+            from starlette.responses import JSONResponse
+            if users:
+                user_status = [
+                    {
+                        "name": u.get("name", u["key"]),
+                        "authenticated": u["key"] in client_map,
+                    }
+                    for u in users
+                ]
+            else:
+                single_key = next(iter(known_keys), None)
+                user_status = [{"name": "default", "authenticated": single_key in client_map}]
+            all_ready = all(u["authenticated"] for u in user_status)
+            return JSONResponse({"ready": all_ready, "users": user_status})
+
         mcp_starlette = app.streamable_http_app()
 
         # Outer ASGI wrapper: routes requests to the right Garmin client via ContextVar
