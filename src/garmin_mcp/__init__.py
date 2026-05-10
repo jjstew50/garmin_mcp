@@ -2,8 +2,11 @@
 Modular MCP Server for Garmin Connect Data
 """
 
+import io
+import json
 import os
 import sys
+from contextvars import ContextVar
 
 import requests
 from mcp.server.fastmcp import FastMCP
@@ -27,215 +30,192 @@ from garmin_mcp import womens_health
 from garmin_mcp import nutrition
 
 
-def is_interactive_terminal() -> bool:
-    """Detect if running in interactive terminal vs MCP subprocess.
+# ---------------------------------------------------------------------------
+# Multi-user routing via ContextVar + proxy
+#
+# Each incoming SSE connection/message sets _active_client to the right
+# Garmin instance for that user. GarminClientProxy forwards every attribute
+# access to whichever client is active in the current async context, so all
+# existing tool functions work unchanged.
+# ---------------------------------------------------------------------------
 
-    Returns:
-        bool: True if running in an interactive terminal, False otherwise
-    """
+_active_client: ContextVar[Garmin] = ContextVar("active_garmin_client")
+
+
+class GarminClientProxy:
+    """Transparent proxy that dispatches attribute access to the per-request Garmin client."""
+
+    def __getattr__(self, name: str):
+        try:
+            client = _active_client.get()
+        except LookupError:
+            raise RuntimeError(
+                "No Garmin client is active for this request. "
+                "Check that MCP_USERS or GARMIN_EMAIL/PASSWORD are configured."
+            )
+        return getattr(client, name)
+
+
+# ---------------------------------------------------------------------------
+# Auth helpers
+# ---------------------------------------------------------------------------
+
+def is_interactive_terminal() -> bool:
     return sys.stdin.isatty() and sys.stdout.isatty()
 
 
 def get_mfa() -> str:
-    """Get MFA code from user input.
-
-    Raises:
-        RuntimeError: If running in non-interactive environment
-    """
     if not is_interactive_terminal():
         print(
             "\nERROR: MFA code required but no interactive terminal available.\n"
-            "Please run 'garmin-mcp-auth' in your terminal first.\n"
-            "See: https://github.com/Taxuspt/garmin_mcp#mfa-setup\n",
+            "Please run 'garmin-mcp-auth' in your terminal first.\n",
             file=sys.stderr,
         )
         raise RuntimeError("MFA required but non-interactive environment")
-
-    print(
-        "\nGarmin Connect MFA required. Please check your email/phone for the code.",
-        file=sys.stderr,
-    )
+    print("\nGarmin Connect MFA required. Please check your email/phone for the code.", file=sys.stderr)
     return input("Enter MFA code: ")
 
 
-# Get credentials from environment
-email = os.environ.get("GARMIN_EMAIL")
-email_file = os.environ.get("GARMIN_EMAIL_FILE")
-if email and email_file:
-    raise ValueError(
-        "Must only provide one of GARMIN_EMAIL and GARMIN_EMAIL_FILE, got both"
-    )
-elif email_file:
-    with open(email_file, "r") as email_file:
-        email = email_file.read().rstrip()
+def init_api(email: str | None, password: str | None, tokens_b64: str | None = None) -> Garmin | None:
+    """Initialize a Garmin client for one user.
 
-password = os.environ.get("GARMIN_PASSWORD")
-password_file = os.environ.get("GARMIN_PASSWORD_FILE")
-if password and password_file:
-    raise ValueError(
-        "Must only provide one of GARMIN_PASSWORD and GARMIN_PASSWORD_FILE, got both"
-    )
-elif password_file:
-    with open(password_file, "r") as password_file:
-        password = password_file.read().rstrip()
+    Priority:
+      1. tokens_b64 argument (passed in from MCP_USERS config)
+      2. GARMINTOKENS_BASE64_CONTENT env var (single-user hosted mode)
+      3. Token files on disk (GARMINTOKENS path)
+      4. email + password re-auth (falls back when tokens missing/expired)
+    """
+    is_cn = os.getenv("GARMIN_IS_CN", "false").lower() in ("true", "1", "yes")
+    tokenstore = os.getenv("GARMINTOKENS") or "~/.garminconnect"
+    tokenstore_base64 = os.getenv("GARMINTOKENS_BASE64") or "~/.garminconnect_base64"
 
-tokenstore = os.getenv("GARMINTOKENS") or "~/.garminconnect"
-tokenstore_base64 = os.getenv("GARMINTOKENS_BASE64") or "~/.garminconnect_base64"
-is_cn = os.getenv("GARMIN_IS_CN", "false").lower() in ("true", "1", "yes")
-
-
-def init_api(email, password):
-    """Initialize Garmin API with your credentials."""
-    import io
-
-    # Check for inline base64 token content (used in hosted/Railway deployments).
-    # User runs garmin-mcp-auth locally, copies ~/.garminconnect_base64 content
-    # into the GARMINTOKENS_BASE64_CONTENT env var on Railway.
-    token_b64_content = os.getenv("GARMINTOKENS_BASE64_CONTENT")
-    if token_b64_content:
+    # 1. Inline base64 tokens (per-user from MCP_USERS, or single-user env var)
+    b64 = tokens_b64 or os.getenv("GARMINTOKENS_BASE64_CONTENT")
+    if b64:
         try:
-            print("Trying to login using GARMINTOKENS_BASE64_CONTENT...\n", file=sys.stderr)
+            print(f"Trying to login via base64 tokens (email={email})...", file=sys.stderr)
             garmin = Garmin(is_cn=is_cn)
-            garmin.garth.loads(token_b64_content.strip())
-            print("Login successful using base64 token content.\n", file=sys.stderr)
+            garmin.garth.loads(b64.strip())
+            print("Login successful via base64 tokens.", file=sys.stderr)
             return garmin
         except Exception as e:
-            print(f"Base64 token load failed ({e}), falling back to file/credential auth.\n", file=sys.stderr)
+            print(f"Base64 token load failed ({e}), falling back to file/credential auth.", file=sys.stderr)
 
+    # 2. Token files on disk
     try:
-        # Using Oauth1 and OAuth2 token files from directory
-        print(
-            f"Trying to login to Garmin Connect using token data from directory '{tokenstore}'...\n",
-            file=sys.stderr,
-        )
-
-        # Suppress stderr for token validation to avoid confusing library errors
+        print(f"Trying token files in '{tokenstore}' (email={email})...", file=sys.stderr)
         old_stderr = sys.stderr
         sys.stderr = io.StringIO()
-
         try:
             garmin = Garmin(is_cn=is_cn)
             garmin.login(tokenstore)
         finally:
             sys.stderr = old_stderr
-
+        print("Login successful via token files.", file=sys.stderr)
+        return garmin
     except (FileNotFoundError, GarthHTTPError, GarminConnectAuthenticationError):
-        # Session is expired. You'll need to log in again
+        pass
 
-        # Check if we're in a non-interactive environment without credentials
-        if not is_interactive_terminal() and (not email or not password):
+    # 3. Re-auth with email + password
+    if not email or not password:
+        if not is_interactive_terminal():
             print(
-                "ERROR: OAuth tokens not found and no interactive terminal available.\n"
-                "Please authenticate first:\n"
-                "  1. Run: garmin-mcp-auth\n"
-                "  2. Enter your credentials and MFA code\n"
-                "  3. Restart your MCP client\n"
-                f"Tokens will be saved to: {tokenstore}\n",
+                "ERROR: No valid tokens and no credentials provided. "
+                "Set GARMIN_EMAIL and GARMIN_PASSWORD, or run garmin-mcp-auth first.",
                 file=sys.stderr,
             )
             return None
 
-        print(
-            "Login tokens not present, login with your Garmin Connect credentials to generate them.\n"
-            f"They will be stored in '{tokenstore}' for future use.\n",
-            file=sys.stderr,
-        )
-        try:
-            garmin = Garmin(
-                email=email, password=password, is_cn=is_cn, prompt_mfa=get_mfa
-            )
-            garmin.login()
-            # Save Oauth1 and Oauth2 token files to directory for next login
-            garmin.garth.dump(tokenstore)
-            print(
-                f"Oauth tokens stored in '{tokenstore}' directory for future use. (first method)\n",
-                file=sys.stderr,
-            )
-            # Encode Oauth1 and Oauth2 tokens to base64 string and safe to file for next login (alternative way)
-            token_base64 = garmin.garth.dumps()
-            dir_path = os.path.expanduser(tokenstore_base64)
-            with open(dir_path, "w") as token_file:
-                token_file.write(token_base64)
-            print(
-                f"Oauth tokens encoded as base64 string and saved to '{dir_path}' file for future use. (second method)\n",
-                file=sys.stderr,
-            )
-        except (
-            FileNotFoundError,
-            GarthHTTPError,
-            GarminConnectAuthenticationError,
-            requests.exceptions.HTTPError,
-        ) as err:
-            error_msg = str(err)
-
-            # Provide clean, actionable error messages
-            print("\nAuthentication failed.", file=sys.stderr)
-
-            if isinstance(err, GarminConnectAuthenticationError):
-                if "MFA" in error_msg or "code" in error_msg.lower():
-                    print("MFA code may be incorrect or expired.", file=sys.stderr)
-                else:
-                    print("Invalid email or password.", file=sys.stderr)
-            elif isinstance(err, GarthHTTPError):
-                if "401" in error_msg or "Unauthorized" in error_msg:
-                    print(
-                        "Invalid credentials. Please check your email and password.",
-                        file=sys.stderr,
-                    )
-                elif "429" in error_msg:
-                    print(
-                        "Too many requests. Please wait and try again.", file=sys.stderr
-                    )
-                elif "500" in error_msg or "503" in error_msg:
-                    print(
-                        "Garmin Connect service issue. Please try again later.",
-                        file=sys.stderr,
-                    )
-                else:
-                    print(f"Error: {error_msg.split(':')[0]}", file=sys.stderr)
-            elif isinstance(err, requests.exceptions.HTTPError):
-                print("Network error. Please check your connection.", file=sys.stderr)
-            else:
-                print(f"Error: {error_msg.split(':')[0]}", file=sys.stderr)
-
-            print(
-                f"\nTip: Run 'garmin-mcp-auth' to authenticate interactively.",
-                file=sys.stderr,
-            )
-            return None
-
-    return garmin
+    print(f"Authenticating with Garmin Connect (email={email})...", file=sys.stderr)
+    try:
+        garmin = Garmin(email=email, password=password, is_cn=is_cn, prompt_mfa=get_mfa)
+        garmin.login()
+        garmin.garth.dump(tokenstore)
+        token_base64 = garmin.garth.dumps()
+        dir_path = os.path.expanduser(tokenstore_base64)
+        with open(dir_path, "w") as f:
+            f.write(token_base64)
+        print(f"Tokens saved to '{tokenstore}' and '{dir_path}'.", file=sys.stderr)
+        return garmin
+    except (FileNotFoundError, GarthHTTPError, GarminConnectAuthenticationError, requests.exceptions.HTTPError) as err:
+        error_msg = str(err)
+        print(f"\nAuthentication failed: {error_msg.split(':')[0]}", file=sys.stderr)
+        return None
 
 
-def _build_api_key_middleware(allowed_keys: set[str]):
-    """Return a Starlette middleware class that checks ?key= on every request except /health."""
-    from starlette.middleware.base import BaseHTTPMiddleware
-    from starlette.responses import PlainTextResponse
+# ---------------------------------------------------------------------------
+# Multi-user config loader
+# ---------------------------------------------------------------------------
 
-    class APIKeyMiddleware(BaseHTTPMiddleware):
-        async def dispatch(self, request, call_next):
-            if request.url.path == "/health":
-                return await call_next(request)
-            key = request.query_params.get("key", "")
-            if key not in allowed_keys:
-                return PlainTextResponse("Unauthorized", status_code=401)
-            return await call_next(request)
+def _load_users() -> list[dict] | None:
+    """Parse MCP_USERS env var (JSON array).
 
-    return APIKeyMiddleware
+    Each entry: {"key": "...", "name": "...", "email": "...", "password": "...", "tokens_b64": "..."}
+    tokens_b64 is optional — omit if using email/password re-auth.
+
+    Returns None if MCP_USERS is not set (fall back to single-user mode).
+    """
+    raw = os.environ.get("MCP_USERS")
+    if not raw:
+        return None
+    try:
+        users = json.loads(raw)
+        if not isinstance(users, list):
+            raise ValueError("MCP_USERS must be a JSON array")
+        for u in users:
+            if "key" not in u:
+                raise ValueError(f"Each user entry must have a 'key' field: {u}")
+        return users
+    except (json.JSONDecodeError, ValueError) as e:
+        print(f"ERROR: Failed to parse MCP_USERS: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
-def main():
-    """Initialize the MCP server and register all tools"""
+# ---------------------------------------------------------------------------
+# ASGI middleware: set the active Garmin client per request based on ?key=
+# ---------------------------------------------------------------------------
 
-    # Initialize Garmin client
-    garmin_client = init_api(email, password)
-    if not garmin_client:
-        print("Failed to initialize Garmin Connect client. Exiting.", file=sys.stderr)
-        return
+def _build_user_router(client_map: dict[str, Garmin], mcp_app):
+    """Raw ASGI middleware that sets the active Garmin client before each request."""
+    from urllib.parse import parse_qs
 
-    print("Garmin Connect client initialized successfully.", file=sys.stderr)
+    async def router(scope, receive, send):
+        if scope["type"] == "http":
+            qs = scope.get("query_string", b"").decode()
+            params = parse_qs(qs)
+            key = params.get("key", [""])[0]
 
-    # Configure all modules with the Garmin client
+            if scope["path"] == "/health":
+                # Health check bypasses auth
+                await mcp_app(scope, receive, send)
+                return
+
+            client = client_map.get(key)
+            if client is None:
+                response_body = b"Unauthorized"
+                await send({"type": "http.response.start", "status": 401,
+                            "headers": [(b"content-type", b"text/plain"),
+                                        (b"content-length", str(len(response_body)).encode())]})
+                await send({"type": "http.response.body", "body": response_body})
+                return
+
+            token = _active_client.set(client)
+            try:
+                await mcp_app(scope, receive, send)
+            finally:
+                _active_client.reset(token)
+        else:
+            await mcp_app(scope, receive, send)
+
+    return router
+
+
+# ---------------------------------------------------------------------------
+# App builder (shared between single-user and multi-user modes)
+# ---------------------------------------------------------------------------
+
+def _configure_and_build_app(garmin_client) -> FastMCP:
+    """Configure all modules with garmin_client and return a fully registered FastMCP app."""
     activity_management.configure(garmin_client)
     health_wellness.configure(garmin_client)
     user_profile.configure(garmin_client)
@@ -249,10 +229,7 @@ def main():
     womens_health.configure(garmin_client)
     nutrition.configure(garmin_client)
 
-    # Create the MCP app
     app = FastMCP("Garmin Connect v1.0")
-
-    # Register tools from all modules
     app = activity_management.register_tools(app)
     app = health_wellness.register_tools(app)
     app = user_profile.register_tools(app)
@@ -265,46 +242,133 @@ def main():
     app = data_management.register_tools(app)
     app = womens_health.register_tools(app)
     app = nutrition.register_tools(app)
-
-    # Register resources (workout templates)
     app = workout_templates.register_resources(app)
+    return app
 
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main():
     transport = os.environ.get("MCP_TRANSPORT", "stdio")
+    users = _load_users()
 
     if transport == "sse":
         import anyio
         import uvicorn
         from starlette.applications import Starlette
-        from starlette.responses import PlainTextResponse as _PlainText
+        from starlette.responses import PlainTextResponse
         from starlette.routing import Mount, Route
 
         async def health(request):
-            return _PlainText("ok")
+            return PlainTextResponse("ok")
 
-        mcp_starlette = app.sse_app()
+        if users:
+            # --- Multi-user mode ---
+            print(f"Multi-user mode: initializing {len(users)} user(s)...", file=sys.stderr)
+            client_map: dict[str, Garmin] = {}
+            for u in users:
+                name = u.get("name", u["key"])
+                client = init_api(u.get("email"), u.get("password"), u.get("tokens_b64"))
+                if client is None:
+                    print(f"WARNING: Could not authenticate user '{name}' — skipping.", file=sys.stderr)
+                    continue
+                client_map[u["key"]] = client
+                print(f"  ✓ {name} ({u.get('email', 'no email')})", file=sys.stderr)
 
-        # Mount health check alongside MCP endpoints
-        combined = Starlette(routes=[
-            Route("/health", health),
-            Mount("/", mcp_starlette),
-        ])
+            if not client_map:
+                print("ERROR: No users authenticated. Exiting.", file=sys.stderr)
+                sys.exit(1)
 
-        # Wrap with API key auth if keys are configured
-        api_keys_raw = os.environ.get("MCP_API_KEYS", "")
-        if api_keys_raw:
-            allowed = {k.strip() for k in api_keys_raw.split(",") if k.strip()}
-            middleware_cls = _build_api_key_middleware(allowed)
-            combined = middleware_cls(combined)
-            print(f"API key auth enabled ({len(allowed)} key(s) configured).", file=sys.stderr)
+            # All modules share one proxy; the proxy routes to the right client per request
+            proxy = GarminClientProxy()
+            app = _configure_and_build_app(proxy)
+
+            mcp_starlette = app.sse_app()
+            combined = Starlette(routes=[
+                Route("/health", health),
+                Mount("/", mcp_starlette),
+            ])
+            asgi_app = _build_user_router(client_map, combined)
+
         else:
-            print("WARNING: MCP_API_KEYS not set — server is open to anyone!", file=sys.stderr)
+            # --- Single-user mode (backward compatible) ---
+            email = os.environ.get("GARMIN_EMAIL")
+            password = os.environ.get("GARMIN_PASSWORD")
+            garmin_client = init_api(email, password)
+            if not garmin_client:
+                print("Failed to initialize Garmin Connect client. Exiting.", file=sys.stderr)
+                sys.exit(1)
+
+            app = _configure_and_build_app(garmin_client)
+            mcp_starlette = app.sse_app()
+            combined = Starlette(routes=[
+                Route("/health", health),
+                Mount("/", mcp_starlette),
+            ])
+
+            # Simple API key middleware for single-user mode
+            api_keys_raw = os.environ.get("MCP_API_KEYS", "")
+            if api_keys_raw:
+                allowed = {k.strip() for k in api_keys_raw.split(",") if k.strip()}
+
+                # Set the single client as active and check the key
+                single_client = garmin_client
+
+                async def single_user_router(scope, receive, send):
+                    from urllib.parse import parse_qs
+                    if scope["type"] == "http" and scope["path"] != "/health":
+                        qs = scope.get("query_string", b"").decode()
+                        key = parse_qs(qs).get("key", [""])[0]
+                        if key not in allowed:
+                            body = b"Unauthorized"
+                            await send({"type": "http.response.start", "status": 401,
+                                        "headers": [(b"content-type", b"text/plain"),
+                                                    (b"content-length", str(len(body)).encode())]})
+                            await send({"type": "http.response.body", "body": body})
+                            return
+                    await combined(scope, receive, send)
+
+                asgi_app = single_user_router
+                print(f"Single-user mode, {len(allowed)} API key(s) configured.", file=sys.stderr)
+            else:
+                print("WARNING: MCP_API_KEYS not set — server is open to anyone!", file=sys.stderr)
+                asgi_app = combined
 
         port = int(os.environ.get("PORT", 8000))
-        config = uvicorn.Config(combined, host="0.0.0.0", port=port, log_level="info")
+        config = uvicorn.Config(asgi_app, host="0.0.0.0", port=port, log_level="info")
         server = uvicorn.Server(config)
-        print(f"Starting SSE transport on port {port}. MCP endpoint: /sse", file=sys.stderr)
+        print(f"Starting SSE server on :{port}  →  connect at /sse?key=YOUR_KEY", file=sys.stderr)
         anyio.run(server.serve)
+
     else:
+        # --- stdio mode (local Claude Desktop use) ---
+        email = os.environ.get("GARMIN_EMAIL")
+        password = os.environ.get("GARMIN_PASSWORD")
+
+        # Resolve file-based credentials
+        email_file = os.environ.get("GARMIN_EMAIL_FILE")
+        if email and email_file:
+            raise ValueError("Provide only one of GARMIN_EMAIL and GARMIN_EMAIL_FILE")
+        elif email_file:
+            with open(email_file) as f:
+                email = f.read().rstrip()
+
+        password_file = os.environ.get("GARMIN_PASSWORD_FILE")
+        if password and password_file:
+            raise ValueError("Provide only one of GARMIN_PASSWORD and GARMIN_PASSWORD_FILE")
+        elif password_file:
+            with open(password_file) as f:
+                password = f.read().rstrip()
+
+        garmin_client = init_api(email, password)
+        if not garmin_client:
+            print("Failed to initialize Garmin Connect client. Exiting.", file=sys.stderr)
+            return
+
+        print("Garmin Connect client initialized successfully.", file=sys.stderr)
+        app = _configure_and_build_app(garmin_client)
         app.run()
 
 
