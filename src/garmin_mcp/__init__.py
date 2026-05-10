@@ -240,7 +240,7 @@ def _configure_and_build_app(garmin_client, auth_server_provider=None, auth=None
     womens_health.configure(garmin_client)
     nutrition.configure(garmin_client)
 
-    app = FastMCP("Garmin Connect v1.0", auth_server_provider=auth_server_provider, auth=auth, streamable_http_path="/sse")
+    app = FastMCP("Garmin Connect v1.0", auth_server_provider=auth_server_provider, auth=auth, streamable_http_path="/sse", host="0.0.0.0")
     app = activity_management.register_tools(app)
     app = health_wellness.register_tools(app)
     app = user_profile.register_tools(app)
