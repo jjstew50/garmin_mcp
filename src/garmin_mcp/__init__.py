@@ -176,34 +176,37 @@ def _load_users() -> list[dict] | None:
 # ---------------------------------------------------------------------------
 
 def _build_user_router(client_map: dict[str, Garmin], mcp_app):
-    """Raw ASGI middleware that sets the active Garmin client before each request."""
-    from urllib.parse import parse_qs
+    """Raw ASGI middleware that sets the active Garmin client based on the Bearer token.
+
+    OAuth flow issues api_key as the access token, so the Bearer value IS the api_key.
+    For unauthenticated paths (/health, OAuth endpoints) we skip routing.
+    """
+    _UNAUTH_PREFIXES = ("/health", "/.well-known", "/authorize", "/token", "/register", "/revoke")
 
     async def router(scope, receive, send):
         if scope["type"] == "http":
-            qs = scope.get("query_string", b"").decode()
-            params = parse_qs(qs)
-            key = params.get("key", [""])[0]
+            path = scope.get("path", "")
 
-            if scope["path"] == "/health":
-                # Health check bypasses auth
+            # Pass through health + OAuth endpoints without requiring a client
+            if any(path.startswith(p) for p in _UNAUTH_PREFIXES):
                 await mcp_app(scope, receive, send)
                 return
 
-            client = client_map.get(key)
-            if client is None:
-                response_body = b"Unauthorized"
-                await send({"type": "http.response.start", "status": 401,
-                            "headers": [(b"content-type", b"text/plain"),
-                                        (b"content-length", str(len(response_body)).encode())]})
-                await send({"type": "http.response.body", "body": response_body})
-                return
+            # Extract Bearer token from Authorization header
+            headers = dict(scope.get("headers", []))
+            auth_header = headers.get(b"authorization", b"").decode()
+            bearer = auth_header[7:] if auth_header.startswith("Bearer ") else ""
 
-            token = _active_client.set(client)
-            try:
+            garmin_client = client_map.get(bearer)
+            if garmin_client is not None:
+                tok = _active_client.set(garmin_client)
+                try:
+                    await mcp_app(scope, receive, send)
+                finally:
+                    _active_client.reset(tok)
+            else:
+                # Let FastMCP's auth middleware handle the 401 response
                 await mcp_app(scope, receive, send)
-            finally:
-                _active_client.reset(token)
         else:
             await mcp_app(scope, receive, send)
 
@@ -214,7 +217,7 @@ def _build_user_router(client_map: dict[str, Garmin], mcp_app):
 # App builder (shared between single-user and multi-user modes)
 # ---------------------------------------------------------------------------
 
-def _configure_and_build_app(garmin_client) -> FastMCP:
+def _configure_and_build_app(garmin_client, auth_server_provider=None, auth=None) -> FastMCP:
     """Configure all modules with garmin_client and return a fully registered FastMCP app."""
     activity_management.configure(garmin_client)
     health_wellness.configure(garmin_client)
@@ -229,7 +232,7 @@ def _configure_and_build_app(garmin_client) -> FastMCP:
     womens_health.configure(garmin_client)
     nutrition.configure(garmin_client)
 
-    app = FastMCP("Garmin Connect v1.0")
+    app = FastMCP("Garmin Connect v1.0", auth_server_provider=auth_server_provider, auth=auth)
     app = activity_management.register_tools(app)
     app = health_wellness.register_tools(app)
     app = user_profile.register_tools(app)
@@ -257,12 +260,16 @@ def main():
     if transport == "sse":
         import anyio
         import uvicorn
-        from starlette.applications import Starlette
-        from starlette.responses import PlainTextResponse
-        from starlette.routing import Mount, Route
+        from starlette.requests import Request
+        from starlette.responses import PlainTextResponse, Response
 
-        async def health(request):
-            return PlainTextResponse("ok")
+        from garmin_mcp.oauth import GarminOAuthProvider
+        from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
+
+        server_url = os.environ.get("MCP_SERVER_URL", "").rstrip("/")
+        if not server_url:
+            print("ERROR: MCP_SERVER_URL must be set in SSE mode (e.g. https://your-app.railway.app)", file=sys.stderr)
+            sys.exit(1)
 
         if users:
             # --- Multi-user mode ---
@@ -281,60 +288,46 @@ def main():
                 print("ERROR: No users authenticated. Exiting.", file=sys.stderr)
                 sys.exit(1)
 
-            # All modules share one proxy; the proxy routes to the right client per request
-            proxy = GarminClientProxy()
-            app = _configure_and_build_app(proxy)
-
-            mcp_starlette = app.sse_app()
-            combined = Starlette(routes=[
-                Route("/health", health),
-                Mount("/", mcp_starlette),
-            ])
-            asgi_app = _build_user_router(client_map, combined)
-
         else:
             # --- Single-user mode (backward compatible) ---
-            email = os.environ.get("GARMIN_EMAIL")
-            password = os.environ.get("GARMIN_PASSWORD")
-            garmin_client = init_api(email, password)
+            single_email = os.environ.get("GARMIN_EMAIL")
+            single_password = os.environ.get("GARMIN_PASSWORD")
+            single_key = os.environ.get("MCP_API_KEYS", "default-key").split(",")[0].strip()
+            garmin_client = init_api(single_email, single_password)
             if not garmin_client:
                 print("Failed to initialize Garmin Connect client. Exiting.", file=sys.stderr)
                 sys.exit(1)
+            client_map = {single_key: garmin_client}
+            print(f"Single-user mode. API key: {single_key}", file=sys.stderr)
 
-            app = _configure_and_build_app(garmin_client)
-            mcp_starlette = app.sse_app()
-            combined = Starlette(routes=[
-                Route("/health", health),
-                Mount("/", mcp_starlette),
-            ])
+        # Build OAuth provider (shared across both modes)
+        oauth_provider = GarminOAuthProvider(
+            api_keys=set(client_map.keys()),
+            server_url=server_url,
+        )
 
-            # Simple API key middleware for single-user mode
-            api_keys_raw = os.environ.get("MCP_API_KEYS", "")
-            if api_keys_raw:
-                allowed = {k.strip() for k in api_keys_raw.split(",") if k.strip()}
+        auth_settings = AuthSettings(
+            issuer_url=server_url,  # type: ignore[arg-type]
+            resource_server_url=None,
+            client_registration_options=ClientRegistrationOptions(enabled=True),
+        )
 
-                # Set the single client as active and check the key
-                single_client = garmin_client
+        # All modules share one proxy; the proxy routes to the right client per request
+        proxy = GarminClientProxy()
+        app = _configure_and_build_app(proxy, auth_server_provider=oauth_provider, auth=auth_settings)
 
-                async def single_user_router(scope, receive, send):
-                    from urllib.parse import parse_qs
-                    if scope["type"] == "http" and scope["path"] != "/health":
-                        qs = scope.get("query_string", b"").decode()
-                        key = parse_qs(qs).get("key", [""])[0]
-                        if key not in allowed:
-                            body = b"Unauthorized"
-                            await send({"type": "http.response.start", "status": 401,
-                                        "headers": [(b"content-type", b"text/plain"),
-                                                    (b"content-length", str(len(body)).encode())]})
-                            await send({"type": "http.response.body", "body": body})
-                            return
-                    await combined(scope, receive, send)
+        # Register custom routes (excluded from bearer auth requirement by FastMCP)
+        form_handler = oauth_provider.make_form_handler()
+        app.custom_route("/authorize-form", methods=["GET", "POST"])(form_handler)
 
-                asgi_app = single_user_router
-                print(f"Single-user mode, {len(allowed)} API key(s) configured.", file=sys.stderr)
-            else:
-                print("WARNING: MCP_API_KEYS not set — server is open to anyone!", file=sys.stderr)
-                asgi_app = combined
+        @app.custom_route("/health", methods=["GET"])
+        async def health_check(request: Request) -> Response:
+            return PlainTextResponse("ok")
+
+        mcp_starlette = app.sse_app()
+
+        # Outer ASGI wrapper: routes requests to the right Garmin client via ContextVar
+        asgi_app = _build_user_router(client_map, mcp_starlette)
 
         port = int(os.environ.get("PORT", 8000))
         config = uvicorn.Config(asgi_app, host="0.0.0.0", port=port, log_level="info")
