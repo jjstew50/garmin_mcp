@@ -12,7 +12,7 @@ import requests
 from mcp.server.fastmcp import FastMCP
 
 from garth.exc import GarthHTTPError
-from garminconnect import Garmin, GarminConnectAuthenticationError
+from garminconnect import Garmin, GarminConnectAuthenticationError, GarminConnectConnectionError
 
 # Import all modules
 from garmin_mcp import activity_management
@@ -145,7 +145,7 @@ def init_api(email: str | None, password: str | None, tokens_b64: str | None = N
         garmin.garth.dump(tokenstore)
         print(f"Tokens saved to '{tokenstore}'.", file=sys.stderr)
         return garmin
-    except (FileNotFoundError, GarthHTTPError, GarminConnectAuthenticationError, requests.exceptions.HTTPError) as err:
+    except (FileNotFoundError, GarthHTTPError, GarminConnectAuthenticationError, GarminConnectConnectionError, requests.exceptions.HTTPError, requests.exceptions.RetryError) as err:
         error_msg = str(err)
         print(f"\nAuthentication failed: {error_msg.split(':')[0]}", file=sys.stderr)
         return None
@@ -289,31 +289,42 @@ def main():
         )
 
         def _background_auth():
+            import time
+            # Retry every 60 minutes — conservative to avoid extending Garmin's rate limit window
+            RETRY_INTERVAL = 3600
+
             if users:
-                print(f"Background auth: initializing {len(users)} user(s)...", file=sys.stderr)
-                for u in users:
-                    name = u.get("name", u["key"])
-                    client = init_api(u.get("email"), u.get("password"), u.get("tokens_b64"))
-                    if client is None:
-                        print(f"  ✗ {name} — authentication failed.", file=sys.stderr)
-                        continue
-                    client_map[u["key"]] = client
-                    oauth_provider._api_keys.add(u["key"])
-                    print(f"  ✓ {name} ({u.get('email', 'no email')})", file=sys.stderr)
-                if not client_map:
-                    print("WARNING: No users authenticated. MCP calls will fail until auth succeeds.", file=sys.stderr)
+                while any(u["key"] not in client_map for u in users):
+                    pending = [u for u in users if u["key"] not in client_map]
+                    print(f"Background auth: attempting {len(pending)} user(s)...", file=sys.stderr)
+                    any_failed = False
+                    for u in pending:
+                        name = u.get("name", u["key"])
+                        client = init_api(u.get("email"), u.get("password"), u.get("tokens_b64"))
+                        if client is None:
+                            print(f"  ✗ {name} — auth failed.", file=sys.stderr)
+                            any_failed = True
+                            continue
+                        client_map[u["key"]] = client
+                        oauth_provider._api_keys.add(u["key"])
+                        print(f"  ✓ {name} ({u.get('email', 'no email')})", file=sys.stderr)
+                    if any_failed:
+                        print("Auth incomplete — retrying in 60 minutes.", file=sys.stderr)
+                        time.sleep(RETRY_INTERVAL)
             else:
                 single_email = os.environ.get("GARMIN_EMAIL")
                 single_password = os.environ.get("GARMIN_PASSWORD")
                 single_key = os.environ.get("MCP_API_KEYS", "default-key").split(",")[0].strip()
-                print("Background auth: single-user mode...", file=sys.stderr)
-                client = init_api(single_email, single_password)
-                if client:
-                    client_map[single_key] = client
-                    oauth_provider._api_keys.add(single_key)
-                    print(f"Single-user authenticated. API key: {single_key}", file=sys.stderr)
-                else:
-                    print("WARNING: Authentication failed. MCP calls will fail until auth succeeds.", file=sys.stderr)
+                while single_key not in client_map:
+                    print("Background auth: single-user mode...", file=sys.stderr)
+                    client = init_api(single_email, single_password)
+                    if client:
+                        client_map[single_key] = client
+                        oauth_provider._api_keys.add(single_key)
+                        print(f"Single-user authenticated. API key: {single_key}", file=sys.stderr)
+                    else:
+                        print("Auth failed — retrying in 60 minutes.", file=sys.stderr)
+                        time.sleep(RETRY_INTERVAL)
 
         import threading
         threading.Thread(target=_background_auth, daemon=True).start()
