@@ -88,20 +88,26 @@ def init_api(email, password):
     """Initialize Garmin API with your credentials."""
     import io
 
+    # Check for inline base64 token content (used in hosted/Railway deployments).
+    # User runs garmin-mcp-auth locally, copies ~/.garminconnect_base64 content
+    # into the GARMINTOKENS_BASE64_CONTENT env var on Railway.
+    token_b64_content = os.getenv("GARMINTOKENS_BASE64_CONTENT")
+    if token_b64_content:
+        try:
+            print("Trying to login using GARMINTOKENS_BASE64_CONTENT...\n", file=sys.stderr)
+            garmin = Garmin(is_cn=is_cn)
+            garmin.garth.loads(token_b64_content.strip())
+            print("Login successful using base64 token content.\n", file=sys.stderr)
+            return garmin
+        except Exception as e:
+            print(f"Base64 token load failed ({e}), falling back to file/credential auth.\n", file=sys.stderr)
+
     try:
         # Using Oauth1 and OAuth2 token files from directory
         print(
             f"Trying to login to Garmin Connect using token data from directory '{tokenstore}'...\n",
             file=sys.stderr,
         )
-
-        # Using Oauth1 and Oauth2 tokens from base64 encoded string
-        # print(
-        #     f"Trying to login to Garmin Connect using token data from file '{tokenstore_base64}'...\n"
-        # )
-        # dir_path = os.path.expanduser(tokenstore_base64)
-        # with open(dir_path, "r") as token_file:
-        #     tokenstore = token_file.read()
 
         # Suppress stderr for token validation to avoid confusing library errors
         old_stderr = sys.stderr
@@ -201,6 +207,23 @@ def init_api(email, password):
     return garmin
 
 
+def _build_api_key_middleware(allowed_keys: set[str]):
+    """Return a Starlette middleware class that checks ?key= on every request except /health."""
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.responses import PlainTextResponse
+
+    class APIKeyMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request, call_next):
+            if request.url.path == "/health":
+                return await call_next(request)
+            key = request.query_params.get("key", "")
+            if key not in allowed_keys:
+                return PlainTextResponse("Unauthorized", status_code=401)
+            return await call_next(request)
+
+    return APIKeyMiddleware
+
+
 def main():
     """Initialize the MCP server and register all tools"""
 
@@ -246,8 +269,43 @@ def main():
     # Register resources (workout templates)
     app = workout_templates.register_resources(app)
 
-    # Run the MCP server
-    app.run()
+    transport = os.environ.get("MCP_TRANSPORT", "stdio")
+
+    if transport == "sse":
+        import anyio
+        import uvicorn
+        from starlette.applications import Starlette
+        from starlette.responses import PlainTextResponse as _PlainText
+        from starlette.routing import Mount, Route
+
+        async def health(request):
+            return _PlainText("ok")
+
+        mcp_starlette = app.sse_app()
+
+        # Mount health check alongside MCP endpoints
+        combined = Starlette(routes=[
+            Route("/health", health),
+            Mount("/", mcp_starlette),
+        ])
+
+        # Wrap with API key auth if keys are configured
+        api_keys_raw = os.environ.get("MCP_API_KEYS", "")
+        if api_keys_raw:
+            allowed = {k.strip() for k in api_keys_raw.split(",") if k.strip()}
+            middleware_cls = _build_api_key_middleware(allowed)
+            combined = middleware_cls(combined)
+            print(f"API key auth enabled ({len(allowed)} key(s) configured).", file=sys.stderr)
+        else:
+            print("WARNING: MCP_API_KEYS not set — server is open to anyone!", file=sys.stderr)
+
+        port = int(os.environ.get("PORT", 8000))
+        config = uvicorn.Config(combined, host="0.0.0.0", port=port, log_level="info")
+        server = uvicorn.Server(config)
+        print(f"Starting SSE transport on port {port}. MCP endpoint: /sse", file=sys.stderr)
+        anyio.run(server.serve)
+    else:
+        app.run()
 
 
 if __name__ == "__main__":
