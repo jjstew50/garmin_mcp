@@ -199,6 +199,84 @@ STRENGTH_CIRCUIT_TEMPLATE = {
     }]
 }
 
+TRIDOT_RUN_TEMPLATE = {
+    "description": "Example upload_running_workout() call — Threshold Repeats (4x6min @ threshold pace with 2min recoveries)",
+    "tool": "upload_running_workout",
+    "pace_reference_mps": {
+        "2.51": "10:41/mile (easy/recovery)",
+        "2.68": "10:00/mile",
+        "2.87": "9:21/mile",
+        "3.21": "8:21/mile (threshold lower)",
+        "3.50": "7:40/mile (threshold upper)",
+    },
+    "example_call": {
+        "name": "2025-11-12 Threshold Repeats",
+        "steps": [
+            {"duration_seconds": 600, "target": {"type": "heart_rate", "min_bpm": 108, "max_bpm": 141},
+             "description": "Easy warmup"},
+            {"duration_seconds": 360, "target": {"type": "speed", "min_mps": 3.21, "max_mps": 3.50},
+             "description": "Threshold"},
+            {"duration_seconds": 120, "target": {"type": "heart_rate", "min_bpm": 108, "max_bpm": 141},
+             "description": "Recovery"},
+            {"duration_seconds": 360, "target": {"type": "speed", "min_mps": 3.21, "max_mps": 3.50},
+             "description": "Threshold"},
+            {"duration_seconds": 120, "target": {"type": "heart_rate", "min_bpm": 108, "max_bpm": 141},
+             "description": "Recovery"},
+            {"duration_seconds": 360, "target": {"type": "speed", "min_mps": 3.21, "max_mps": 3.50},
+             "description": "Threshold"},
+            {"duration_seconds": 120, "target": {"type": "heart_rate", "min_bpm": 108, "max_bpm": 141},
+             "description": "Recovery"},
+            {"duration_seconds": 360, "target": {"type": "speed", "min_mps": 3.21, "max_mps": 3.50},
+             "description": "Threshold"},
+            {"duration_seconds": 1200, "target": {"type": "heart_rate", "min_bpm": 108, "max_bpm": 141},
+             "description": "Cooldown"},
+        ],
+    },
+    "notes": [
+        "Steps are flat (no nesting/repeat groups) — write out each interval explicitly",
+        "All steps are time-based; distance-based steps are not supported",
+        "speed target uses absolute m/s range (not pace zones); use pace_to_mps() to convert",
+        "heart_rate target uses absolute BPM range (not zone numbers)",
+    ],
+}
+
+TRIDOT_CYCLING_TEMPLATE = {
+    "description": "Example upload_cycling_workout() call — Threshold Intervals with power targets",
+    "tool": "upload_cycling_workout",
+    "power_zone_reference_ftp280": {
+        "174-214W": "Easy/recovery (~62-76% FTP)",
+        "217-257W": "Tempo/sweet spot (~77-92% FTP)",
+        "259-299W": "Threshold (~92-107% FTP)",
+        "302-342W": "Above threshold (~108-122% FTP)",
+    },
+    "ftp_conversion": "Use ftp_percent_to_watts(ftp, low_pct, high_pct), e.g. ftp_percent_to_watts(280, 0.92, 1.07) -> (258, 300)",
+    "example_call": {
+        "name": "2025-11-10 Threshold Intervals",
+        "steps": [
+            {"duration_seconds": 240, "target": {"type": "heart_rate", "min_bpm": 101, "max_bpm": 122}},
+            {"duration_seconds": 30, "target": {"type": "heart_rate", "min_bpm": 101, "max_bpm": 122},
+             "description": "Spinup!"},
+            {"duration_seconds": 30, "target": {"type": "heart_rate", "min_bpm": 101, "max_bpm": 122},
+             "description": "Easy Spin"},
+            {"duration_seconds": 960, "target": {"type": "power", "min_watts": 259, "max_watts": 299},
+             "description": "Cadence @ 80 rpm"},
+            {"duration_seconds": 120, "target": {"type": "power", "min_watts": 174, "max_watts": 214}},
+            {"duration_seconds": 960, "target": {"type": "power", "min_watts": 259, "max_watts": 299}},
+            {"duration_seconds": 120, "target": {"type": "power", "min_watts": 174, "max_watts": 214}},
+            {"duration_seconds": 960, "target": {"type": "power", "min_watts": 259, "max_watts": 299}},
+            {"duration_seconds": 600, "target": {"type": "power", "min_watts": 174, "max_watts": 214},
+             "description": "Cooldown spin"},
+        ],
+    },
+    "notes": [
+        "Steps are flat (no nesting/repeat groups) — write out each interval explicitly",
+        "All steps are time-based; distance-based steps are not supported",
+        "power target uses absolute watts range (not FTP zone numbers)",
+        "heart_rate target uses absolute BPM range (not zone numbers)",
+        "Short spinup steps (30s) are common in Tridot cycling workouts before main blocks",
+    ],
+}
+
 # Reference documentation for workout structure
 WORKOUT_STRUCTURE_REFERENCE = {
     "description": "Reference guide for Garmin workout JSON structure",
@@ -221,7 +299,9 @@ WORKOUT_STRUCTURE_REFERENCE = {
     "targetType_values": {
         "1": {"workoutTargetTypeKey": "no.target", "description": "No specific target"},
         "4": {"workoutTargetTypeKey": "heart.rate.zone", "description": "Heart rate zone (use zoneNumber 1-5)"},
-        "6": {"workoutTargetTypeKey": "pace.zone", "description": "Pace zone (use zoneNumber)"}
+        "2": {"workoutTargetTypeKey": "power.zone", "description": "Power zone (use targetValueOne/targetValueTwo for absolute watts range)"},
+        "5": {"workoutTargetTypeKey": "speed.zone", "description": "Speed zone (use targetValueOne/targetValueTwo for absolute m/s range)"},
+        "6": {"workoutTargetTypeKey": "pace.zone", "description": "Pace zone by number (use zoneNumber 1-5)"}
     },
     "sportType_values": {
         "1": {"sportTypeKey": "running"},
@@ -271,6 +351,26 @@ def register_resources(app):
         3 rounds of 10min work + 2min rest.
         """
         return json.dumps(STRENGTH_CIRCUIT_TEMPLATE, indent=2)
+
+    @app.resource("workout://templates/tridot-run")
+    async def get_tridot_run_template() -> str:
+        """Tridot-style running workout template using upload_running_workout()
+
+        Demonstrates a Threshold Repeats pattern (4x6min @ threshold pace).
+        Uses flat step structure with absolute speed (m/s) and HR (BPM) targets.
+        Includes pace reference table for m/s ↔ min/mile conversion.
+        """
+        return json.dumps(TRIDOT_RUN_TEMPLATE, indent=2)
+
+    @app.resource("workout://templates/tridot-cycling")
+    async def get_tridot_cycling_template() -> str:
+        """Tridot-style cycling workout template using upload_cycling_workout()
+
+        Demonstrates a Threshold Intervals pattern with power and HR targets.
+        Uses flat step structure with absolute power (watts) and HR (BPM) targets.
+        Includes FTP% conversion reference.
+        """
+        return json.dumps(TRIDOT_CYCLING_TEMPLATE, indent=2)
 
     @app.resource("workout://reference/structure")
     async def get_structure_reference() -> str:
