@@ -28,6 +28,7 @@ from garmin_mcp import workout_templates
 from garmin_mcp import data_management
 from garmin_mcp import womens_health
 from garmin_mcp import nutrition
+from garmin_mcp import tracker
 
 
 # ---------------------------------------------------------------------------
@@ -84,6 +85,39 @@ def _user_tokenstore(base: str, email: str | None) -> str:
     return os.path.join(os.path.expanduser(base), safe)
 
 
+def _seed_tokens_from_env(tokenstore: str) -> None:
+    """Write oauth1/oauth2 token files from env vars on every startup.
+
+    Reads GARMIN_OAUTH1_TOKEN and GARMIN_OAUTH2_TOKEN (base64-encoded JSON)
+    and writes them to the tokenstore directory, always overwriting. This
+    ensures stale or missing volume files never cause a fallback to
+    email/password auth (which triggers Garmin's 429 rate limit).
+    """
+    import base64
+
+    token_env_map = {
+        "GARMIN_OAUTH1_TOKEN": "oauth1_token.json",
+        "GARMIN_OAUTH2_TOKEN": "oauth2_token.json",
+    }
+    any_seeded = False
+    for env_var, filename in token_env_map.items():
+        b64 = os.environ.get(env_var, "").strip()
+        if not b64:
+            continue
+        dest = os.path.join(tokenstore, filename)
+        try:
+            decoded = base64.b64decode(b64)
+            os.makedirs(tokenstore, exist_ok=True)
+            with open(dest, "wb") as f:
+                f.write(decoded)
+            print(f"Token seed: wrote {filename} from {env_var}.", file=sys.stderr)
+            any_seeded = True
+        except Exception as e:
+            print(f"Token seed: failed to write {filename} from {env_var}: {e}", file=sys.stderr)
+    if not any_seeded and not any(os.environ.get(v) for v in token_env_map):
+        pass  # neither env var set — normal local mode, no-op
+
+
 def init_api(email: str | None, password: str | None, tokens_b64: str | None = None) -> Garmin | None:
     """Initialize a Garmin client for one user.
 
@@ -91,11 +125,15 @@ def init_api(email: str | None, password: str | None, tokens_b64: str | None = N
       1. tokens_b64 argument (passed in from MCP_USERS config)
       2. GARMINTOKENS_BASE64_CONTENT env var (single-user hosted mode)
       3. Token files on disk (per-user subdirectory under GARMINTOKENS path)
+         — seeded from GARMIN_OAUTH1_TOKEN / GARMIN_OAUTH2_TOKEN env vars on first boot
       4. email + password re-auth (falls back when tokens missing/expired)
     """
     is_cn = os.getenv("GARMIN_IS_CN", "false").lower() in ("true", "1", "yes")
     tokenstore_base = os.getenv("GARMINTOKENS") or "~/.garminconnect"
     tokenstore = _user_tokenstore(tokenstore_base, email)
+
+    # Seed token files from env vars on first boot (no-op if files already exist)
+    _seed_tokens_from_env(tokenstore)
 
     # 1. Inline base64 tokens (per-user from MCP_USERS, or single-user env var)
     b64 = tokens_b64 or os.getenv("GARMINTOKENS_BASE64_CONTENT")
@@ -239,6 +277,7 @@ def _configure_and_build_app(garmin_client, auth_server_provider=None, auth=None
     data_management.configure(garmin_client)
     womens_health.configure(garmin_client)
     nutrition.configure(garmin_client)
+    tracker.configure(garmin_client)
 
     app = FastMCP("Garmin Connect v1.0", auth_server_provider=auth_server_provider, auth=auth, streamable_http_path="/sse", host="0.0.0.0")
     app = activity_management.register_tools(app)
@@ -253,6 +292,7 @@ def _configure_and_build_app(garmin_client, auth_server_provider=None, auth=None
     app = data_management.register_tools(app)
     app = womens_health.register_tools(app)
     app = nutrition.register_tools(app)
+    app = tracker.register_tools(app)
     app = workout_templates.register_resources(app)
     return app
 
