@@ -9,7 +9,14 @@ services:
     environment:
       - GARMIN_EMAIL=${GARMIN_EMAIL}
       - GARMIN_PASSWORD=${GARMIN_PASSWORD}
-      # - GARMIN_IS_CN=true  # Uncomment to use Garmin Connect China (garmin.cn)
+      - GARMIN_DATA_PATH=/app/data
+      # - GARMIN_IS_CN=true           # Uncomment to use Garmin Connect China (garmin.cn)
+
+      # --- Optional addons (off by default, base Garmin MCP works without these) ---
+      # - GARMIN_TRACKER_ENABLED=true       # Enables raw data sync + query tools (SQLite)
+      # - GARMIN_TRAINING_MEMORY=true       # Enables training plans, phases, notes, auto-matching (implies tracker)
+      # - GARMIN_AUTO_MATCH_THRESHOLD=0.75  # 0.0-1.0 confidence required to auto-link planned→actual workout
+      # - GARMIN_AUTO_MATCH_ENABLED=true    # Run auto-match whenever activities are synced
 
     # Option 2: Use file-based secrets (uncomment to use)
     # environment:
@@ -19,9 +26,10 @@ services:
     #   - garmin_email
     #   - garmin_password
 
-    # Mount volume to persist Garmin OAuth tokens
+    # Mount volumes to persist Garmin OAuth tokens and tracker database
     volumes:
       - garmin-tokens:/root/.garminconnect
+      - garmin-data:/app/data
 
     # Restart policy
     restart: unless-stopped
@@ -32,6 +40,8 @@ services:
 
 volumes:
   garmin-tokens:
+    driver: local
+  garmin-data:
     driver: local
 
 # Uncomment if using file-based secrets

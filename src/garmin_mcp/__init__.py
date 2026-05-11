@@ -14,7 +14,7 @@ from mcp.server.fastmcp import FastMCP
 from garth.exc import GarthHTTPError
 from garminconnect import Garmin, GarminConnectAuthenticationError, GarminConnectConnectionError
 
-# Import all modules
+# Import core Garmin modules (always enabled)
 from garmin_mcp import activity_management
 from garmin_mcp import health_wellness
 from garmin_mcp import user_profile
@@ -28,7 +28,18 @@ from garmin_mcp import workout_templates
 from garmin_mcp import data_management
 from garmin_mcp import womens_health
 from garmin_mcp import nutrition
-from garmin_mcp import tracker
+
+# Feature flags — opt-in addons that layer on top of the base Garmin MCP
+# GARMIN_TRACKER_ENABLED=true  → sync + query raw Garmin data to local SQLite
+# GARMIN_TRAINING_MEMORY=true  → training plans, phases, notes, auto-matching (implies tracker)
+_TRACKER_ENABLED = os.environ.get("GARMIN_TRACKER_ENABLED", "false").lower() in ("true", "1", "yes")
+_TRAINING_MEMORY_ENABLED = os.environ.get("GARMIN_TRAINING_MEMORY", "false").lower() in ("true", "1", "yes")
+
+if _TRACKER_ENABLED or _TRAINING_MEMORY_ENABLED:
+    from garmin_mcp import tracker
+
+if _TRAINING_MEMORY_ENABLED:
+    from garmin_mcp import training_memory
 
 
 # ---------------------------------------------------------------------------
@@ -277,7 +288,11 @@ def _configure_and_build_app(garmin_client, auth_server_provider=None, auth=None
     data_management.configure(garmin_client)
     womens_health.configure(garmin_client)
     nutrition.configure(garmin_client)
-    tracker.configure(garmin_client)
+
+    if _TRACKER_ENABLED or _TRAINING_MEMORY_ENABLED:
+        tracker.configure(garmin_client)
+    if _TRAINING_MEMORY_ENABLED:
+        training_memory.configure(garmin_client)
 
     app = FastMCP("Garmin Connect v1.0", auth_server_provider=auth_server_provider, auth=auth, streamable_http_path="/sse", host="0.0.0.0")
     app = activity_management.register_tools(app)
@@ -292,7 +307,12 @@ def _configure_and_build_app(garmin_client, auth_server_provider=None, auth=None
     app = data_management.register_tools(app)
     app = womens_health.register_tools(app)
     app = nutrition.register_tools(app)
-    app = tracker.register_tools(app)
+
+    if _TRACKER_ENABLED or _TRAINING_MEMORY_ENABLED:
+        app = tracker.register_tools(app)
+    if _TRAINING_MEMORY_ENABLED:
+        app = training_memory.register_tools(app)
+
     app = workout_templates.register_resources(app)
     return app
 

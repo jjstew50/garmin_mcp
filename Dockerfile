@@ -32,6 +32,10 @@ COPY pytest.ini ./
 RUN mkdir -p /root/.garminconnect && \
     chmod 700 /root/.garminconnect
 
+# Create directory for tracker database (mounted as Docker volume)
+RUN mkdir -p /app/data && \
+    chmod 755 /app/data
+
 # Expose HTTP port (used when MCP_TRANSPORT=sse)
 EXPOSE 8000
 
