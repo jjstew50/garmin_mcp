@@ -310,7 +310,7 @@ def _build_user_router(client_map: dict[str, Garmin], features_map: dict[str, di
     """
     _UNAUTH_PREFIXES = (
         "/health", "/.well-known", "/authorize", "/token",
-        "/register", "/revoke", "/connect",
+        "/register", "/revoke", "/connect", "/authorize-form",
     )
 
     async def router(scope, receive, send):
@@ -510,6 +510,8 @@ def main():
         oauth_provider = GarminOAuthProvider(
             api_keys=known_keys,
             server_url=server_url,
+            client_map=_client_map,
+            tokenstore_base=tokenstore_base,
         )
 
         def _background_auth():
@@ -577,6 +579,8 @@ def main():
         # Register custom routes (excluded from bearer auth requirement by FastMCP)
         form_handler = oauth_provider.make_form_handler()
         app.custom_route("/authorize-form", methods=["GET", "POST"])(form_handler)
+        mfa_handler = oauth_provider.make_mfa_handler()
+        app.custom_route("/authorize-form/mfa", methods=["GET", "POST"])(mfa_handler)
 
         # Garmin Connect web login flow
         from garmin_mcp.connect import register_routes as _register_connect
