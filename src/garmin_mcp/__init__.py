@@ -97,37 +97,50 @@ def _seed_tokens_if_missing(
     oauth1_b64: str | None = None,
     oauth2_b64: str | None = None,
 ) -> bool:
-    """Write oauth token files to the volume ONLY if they don't already exist.
+    """Seed oauth token files to the volume.
 
-    Per-user tokens (oauth1_b64/oauth2_b64) take precedence over the global
-    GARMIN_OAUTH1_TOKEN / GARMIN_OAUTH2_TOKEN env vars.
+    Per-user tokens (oauth1_b64/oauth2_b64 from MCP_USERS) are ALWAYS written —
+    they represent an explicit configuration update and must take effect on restart.
 
-    Returns True if any token file was already on disk before this call —
+    Global env var fallbacks (GARMIN_OAUTH1_TOKEN / GARMIN_OAUTH2_TOKEN) are only
+    written if the file doesn't already exist, preserving any tokens garth has
+    refreshed and written to the volume during a prior run.
+
+    Returns True if any token files exist on disk after seeding —
     used by init_api to decide whether to skip email/password fallback.
     """
     import base64
 
     token_map = {
-        "oauth1_token.json": oauth1_b64 or os.environ.get("GARMIN_OAUTH1_TOKEN", "").strip(),
-        "oauth2_token.json": oauth2_b64 or os.environ.get("GARMIN_OAUTH2_TOKEN", "").strip(),
+        "oauth1_token.json": (oauth1_b64, os.environ.get("GARMIN_OAUTH1_TOKEN", "").strip()),
+        "oauth2_token.json": (oauth2_b64, os.environ.get("GARMIN_OAUTH2_TOKEN", "").strip()),
     }
-    any_pre_existing = False
-    for filename, b64 in token_map.items():
+    for filename, (user_b64, env_b64) in token_map.items():
         dest = os.path.join(tokenstore, filename)
-        if os.path.exists(dest):
-            any_pre_existing = True
-            continue  # already on volume — don't overwrite
-        if not b64:
+        if user_b64:
+            # Explicit per-user token — always overwrite so updates take effect
+            b64 = user_b64
+        elif os.path.exists(dest):
+            continue  # env var fallback, file already on volume — preserve it
+        elif env_b64:
+            b64 = env_b64  # first boot with global env var
+        else:
             continue
         try:
             decoded = base64.b64decode(b64)
             os.makedirs(tokenstore, exist_ok=True)
             with open(dest, "wb") as f:
                 f.write(decoded)
-            print(f"Token seed: wrote {filename} to volume (first boot).", file=sys.stderr)
+            src = "user config" if user_b64 else "env var (first boot)"
+            print(f"Token seed: wrote {filename} from {src}.", file=sys.stderr)
         except Exception as e:
             print(f"Token seed: failed to write {filename}: {e}", file=sys.stderr)
-    return any_pre_existing
+
+    # Return True if any token files now exist — triggers no-password-fallback in init_api
+    return any(
+        os.path.exists(os.path.join(tokenstore, f))
+        for f in token_map
+    )
 
 
 def init_api(
