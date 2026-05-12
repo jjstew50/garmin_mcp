@@ -28,18 +28,10 @@ from garmin_mcp import workout_templates
 from garmin_mcp import data_management
 from garmin_mcp import womens_health
 from garmin_mcp import nutrition
+from garmin_mcp.context import _active_user_features
 
-# Feature flags — opt-in addons that layer on top of the base Garmin MCP
-# GARMIN_TRACKER_ENABLED=true  → sync + query raw Garmin data to local SQLite
-# GARMIN_TRAINING_MEMORY=true  → training plans, phases, notes, auto-matching (implies tracker)
-_TRACKER_ENABLED = os.environ.get("GARMIN_TRACKER_ENABLED", "false").lower() in ("true", "1", "yes")
-_TRAINING_MEMORY_ENABLED = os.environ.get("GARMIN_TRAINING_MEMORY", "false").lower() in ("true", "1", "yes")
-
-if _TRACKER_ENABLED or _TRAINING_MEMORY_ENABLED:
-    from garmin_mcp import tracker
-
-if _TRAINING_MEMORY_ENABLED:
-    from garmin_mcp import training_memory
+# tracker and training_memory are imported conditionally inside main() after
+# MCP_USERS is parsed, so per-user "training_memory" flags can drive the decision.
 
 
 # ---------------------------------------------------------------------------
@@ -52,6 +44,7 @@ if _TRAINING_MEMORY_ENABLED:
 # ---------------------------------------------------------------------------
 
 _active_client: ContextVar[Garmin] = ContextVar("active_garmin_client")
+# _active_user_features is imported from context.py (shared with training_memory)
 
 
 class GarminClientProxy:
@@ -96,55 +89,69 @@ def _user_tokenstore(base: str, email: str | None) -> str:
     return os.path.join(os.path.expanduser(base), safe)
 
 
-def _seed_tokens_from_env(tokenstore: str) -> None:
-    """Write oauth1/oauth2 token files from env vars on every startup.
+def _seed_tokens_if_missing(
+    tokenstore: str,
+    oauth1_b64: str | None = None,
+    oauth2_b64: str | None = None,
+) -> bool:
+    """Write oauth token files to the volume ONLY if they don't already exist.
 
-    Reads GARMIN_OAUTH1_TOKEN and GARMIN_OAUTH2_TOKEN (base64-encoded JSON)
-    and writes them to the tokenstore directory, always overwriting. This
-    ensures stale or missing volume files never cause a fallback to
-    email/password auth (which triggers Garmin's 429 rate limit).
+    Per-user tokens (oauth1_b64/oauth2_b64) take precedence over the global
+    GARMIN_OAUTH1_TOKEN / GARMIN_OAUTH2_TOKEN env vars.
+
+    Returns True if any token file was already on disk before this call —
+    used by init_api to decide whether to skip email/password fallback.
     """
     import base64
 
-    token_env_map = {
-        "GARMIN_OAUTH1_TOKEN": "oauth1_token.json",
-        "GARMIN_OAUTH2_TOKEN": "oauth2_token.json",
+    token_map = {
+        "oauth1_token.json": oauth1_b64 or os.environ.get("GARMIN_OAUTH1_TOKEN", "").strip(),
+        "oauth2_token.json": oauth2_b64 or os.environ.get("GARMIN_OAUTH2_TOKEN", "").strip(),
     }
-    any_seeded = False
-    for env_var, filename in token_env_map.items():
-        b64 = os.environ.get(env_var, "").strip()
+    any_pre_existing = False
+    for filename, b64 in token_map.items():
+        dest = os.path.join(tokenstore, filename)
+        if os.path.exists(dest):
+            any_pre_existing = True
+            continue  # already on volume — don't overwrite
         if not b64:
             continue
-        dest = os.path.join(tokenstore, filename)
         try:
             decoded = base64.b64decode(b64)
             os.makedirs(tokenstore, exist_ok=True)
             with open(dest, "wb") as f:
                 f.write(decoded)
-            print(f"Token seed: wrote {filename} from {env_var}.", file=sys.stderr)
-            any_seeded = True
+            print(f"Token seed: wrote {filename} to volume (first boot).", file=sys.stderr)
         except Exception as e:
-            print(f"Token seed: failed to write {filename} from {env_var}: {e}", file=sys.stderr)
-    if not any_seeded and not any(os.environ.get(v) for v in token_env_map):
-        pass  # neither env var set — normal local mode, no-op
+            print(f"Token seed: failed to write {filename}: {e}", file=sys.stderr)
+    return any_pre_existing
 
 
-def init_api(email: str | None, password: str | None, tokens_b64: str | None = None) -> Garmin | None:
+def init_api(
+    email: str | None,
+    password: str | None,
+    tokens_b64: str | None = None,
+    oauth1_b64: str | None = None,
+    oauth2_b64: str | None = None,
+) -> Garmin | None:
     """Initialize a Garmin client for one user.
 
     Priority:
       1. tokens_b64 argument (passed in from MCP_USERS config)
       2. GARMINTOKENS_BASE64_CONTENT env var (single-user hosted mode)
       3. Token files on disk (per-user subdirectory under GARMINTOKENS path)
-         — seeded from GARMIN_OAUTH1_TOKEN / GARMIN_OAUTH2_TOKEN env vars on first boot
-      4. email + password re-auth (falls back when tokens missing/expired)
+         — seeded from per-user oauth1_b64/oauth2_b64 (or global env var fallbacks)
+         on first boot only; never overwritten on subsequent startups
+      4. email + password re-auth (only if no token files existed on the volume,
+         i.e. fresh setup — skipped when volume tokens are present to avoid 429s)
     """
     is_cn = os.getenv("GARMIN_IS_CN", "false").lower() in ("true", "1", "yes")
     tokenstore_base = os.getenv("GARMINTOKENS") or "~/.garminconnect"
     tokenstore = _user_tokenstore(tokenstore_base, email)
 
-    # Seed token files from env vars on first boot (no-op if files already exist)
-    _seed_tokens_from_env(tokenstore)
+    # Seed token files only if they don't already exist on the volume.
+    # Returns True when files were pre-existing (skip email/password fallback).
+    had_volume_tokens = _seed_tokens_if_missing(tokenstore, oauth1_b64, oauth2_b64)
 
     # 1. Inline base64 tokens (per-user from MCP_USERS, or single-user env var)
     b64 = tokens_b64 or os.getenv("GARMINTOKENS_BASE64_CONTENT")
@@ -177,6 +184,16 @@ def init_api(email: str | None, password: str | None, tokens_b64: str | None = N
         pass
 
     # 3. Re-auth with email + password
+    # Skipped when volume tokens were present — avoids triggering Garmin's 429 rate limit.
+    # If volume tokens failed, update oauth1_token/oauth2_token in MCP_USERS and restart.
+    if had_volume_tokens:
+        print(
+            f"ERROR: Volume token files exist but auth failed for {email}. "
+            "Update oauth1_token/oauth2_token in MCP_USERS (or run garmin-mcp-auth) and restart.",
+            file=sys.stderr,
+        )
+        return None
+
     if not email or not password:
         if not is_interactive_terminal():
             print(
@@ -232,11 +249,12 @@ def _load_users() -> list[dict] | None:
 # ASGI middleware: set the active Garmin client per request based on ?key=
 # ---------------------------------------------------------------------------
 
-def _build_user_router(client_map: dict[str, Garmin], mcp_app):
+def _build_user_router(client_map: dict[str, Garmin], features_map: dict[str, dict], mcp_app):
     """Raw ASGI middleware that sets the active Garmin client based on the Bearer token.
 
     OAuth flow issues api_key as the access token, so the Bearer value IS the api_key.
     For unauthenticated paths (/health, OAuth endpoints) we skip routing.
+    Also sets _active_user_features so per-user feature flags are available in tools.
     """
     _UNAUTH_PREFIXES = ("/health", "/.well-known", "/authorize", "/token", "/register", "/revoke")
 
@@ -256,11 +274,13 @@ def _build_user_router(client_map: dict[str, Garmin], mcp_app):
 
             garmin_client = client_map.get(bearer)
             if garmin_client is not None:
-                tok = _active_client.set(garmin_client)
+                tok1 = _active_client.set(garmin_client)
+                tok2 = _active_user_features.set(features_map.get(bearer, {}))
                 try:
                     await mcp_app(scope, receive, send)
                 finally:
-                    _active_client.reset(tok)
+                    _active_client.reset(tok1)
+                    _active_user_features.reset(tok2)
             else:
                 # Let FastMCP's auth middleware handle the 401 response
                 await mcp_app(scope, receive, send)
@@ -274,7 +294,13 @@ def _build_user_router(client_map: dict[str, Garmin], mcp_app):
 # App builder (shared between single-user and multi-user modes)
 # ---------------------------------------------------------------------------
 
-def _configure_and_build_app(garmin_client, auth_server_provider=None, auth=None) -> FastMCP:
+def _configure_and_build_app(
+    garmin_client,
+    auth_server_provider=None,
+    auth=None,
+    tracker=None,
+    training_memory=None,
+) -> FastMCP:
     """Configure all modules with garmin_client and return a fully registered FastMCP app."""
     activity_management.configure(garmin_client)
     health_wellness.configure(garmin_client)
@@ -289,9 +315,9 @@ def _configure_and_build_app(garmin_client, auth_server_provider=None, auth=None
     womens_health.configure(garmin_client)
     nutrition.configure(garmin_client)
 
-    if _TRACKER_ENABLED or _TRAINING_MEMORY_ENABLED:
+    if tracker:
         tracker.configure(garmin_client)
-    if _TRAINING_MEMORY_ENABLED:
+    if training_memory:
         training_memory.configure(garmin_client)
 
     app = FastMCP("Garmin Connect v1.0", auth_server_provider=auth_server_provider, auth=auth, streamable_http_path="/sse", host="0.0.0.0")
@@ -308,9 +334,9 @@ def _configure_and_build_app(garmin_client, auth_server_provider=None, auth=None
     app = womens_health.register_tools(app)
     app = nutrition.register_tools(app)
 
-    if _TRACKER_ENABLED or _TRAINING_MEMORY_ENABLED:
+    if tracker:
         app = tracker.register_tools(app)
-    if _TRAINING_MEMORY_ENABLED:
+    if training_memory:
         app = training_memory.register_tools(app)
 
     app = workout_templates.register_resources(app)
@@ -324,6 +350,22 @@ def _configure_and_build_app(garmin_client, auth_server_provider=None, auth=None
 def main():
     transport = os.environ.get("MCP_TRANSPORT", "stdio")
     users = _load_users()
+
+    # Determine which optional modules to load — driven by per-user flags OR global env vars.
+    _any_training_memory = (
+        os.environ.get("GARMIN_TRAINING_MEMORY", "false").lower() in ("true", "1", "yes")
+        or any(u.get("training_memory") for u in (users or []))
+    )
+    _any_tracker = _any_training_memory or (
+        os.environ.get("GARMIN_TRACKER_ENABLED", "false").lower() in ("true", "1", "yes")
+    )
+
+    _tracker_mod = None
+    _training_memory_mod = None
+    if _any_tracker:
+        from garmin_mcp import tracker as _tracker_mod  # type: ignore[assignment]
+    if _any_training_memory:
+        from garmin_mcp import training_memory as _training_memory_mod  # type: ignore[assignment]
 
     if transport == "sse":
         import anyio
@@ -344,8 +386,14 @@ def main():
         client_map: dict[str, Garmin] = {}
         if users:
             known_keys = {u["key"] for u in users}
+            # Per-user feature flags — keyed by API key for O(1) lookup in middleware.
+            features_map: dict[str, dict] = {
+                u["key"]: {"training_memory": bool(u.get("training_memory"))}
+                for u in users
+            }
         else:
             known_keys = {k.strip() for k in os.environ.get("MCP_API_KEYS", "default-key").split(",") if k.strip()}
+            features_map = {}
 
         oauth_provider = GarminOAuthProvider(
             api_keys=known_keys,
@@ -364,7 +412,11 @@ def main():
                     any_failed = False
                     for u in pending:
                         name = u.get("name", u["key"])
-                        client = init_api(u.get("email"), u.get("password"), u.get("tokens_b64"))
+                        client = init_api(
+                        u.get("email"), u.get("password"), u.get("tokens_b64"),
+                        oauth1_b64=u.get("oauth1_token"),
+                        oauth2_b64=u.get("oauth2_token"),
+                    )
                         if client is None:
                             print(f"  ✗ {name} — auth failed.", file=sys.stderr)
                             any_failed = True
@@ -399,7 +451,13 @@ def main():
 
         # All modules share one proxy; the proxy routes to the right client per request
         proxy = GarminClientProxy()
-        app = _configure_and_build_app(proxy, auth_server_provider=oauth_provider, auth=auth_settings)
+        app = _configure_and_build_app(
+            proxy,
+            auth_server_provider=oauth_provider,
+            auth=auth_settings,
+            tracker=_tracker_mod,
+            training_memory=_training_memory_mod,
+        )
 
         # Register custom routes (excluded from bearer auth requirement by FastMCP)
         form_handler = oauth_provider.make_form_handler()
@@ -429,7 +487,7 @@ def main():
         mcp_starlette = app.streamable_http_app()
 
         # Outer ASGI wrapper: routes requests to the right Garmin client via ContextVar
-        asgi_app = _build_user_router(client_map, mcp_starlette)
+        asgi_app = _build_user_router(client_map, features_map, mcp_starlette)
 
         port = int(os.environ.get("PORT", 8000))
         config = uvicorn.Config(
@@ -465,7 +523,7 @@ def main():
             return
 
         print("Garmin Connect client initialized successfully.", file=sys.stderr)
-        app = _configure_and_build_app(garmin_client)
+        app = _configure_and_build_app(garmin_client, tracker=_tracker_mod, training_memory=_training_memory_mod)
         app.run()
 
 

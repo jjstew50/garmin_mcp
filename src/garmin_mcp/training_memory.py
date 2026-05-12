@@ -27,8 +27,18 @@ from datetime import datetime, timezone, date as Date, timedelta
 
 import aiosqlite
 
+from garmin_mcp.context import _active_user_features
+
 garmin_client = None
 _db_initialized = False
+
+
+def _check_feature_enabled() -> str | None:
+    """Return an error JSON string if training_memory is disabled for the current user, else None."""
+    features = _active_user_features.get()
+    if "training_memory" in features and not features["training_memory"]:
+        return json.dumps({"error": "training_memory feature not enabled for this user"})
+    return None
 
 TRAINING_SCHEMA_DDL = """
 CREATE TABLE IF NOT EXISTS training_phases (
@@ -208,6 +218,8 @@ def register_tools(app):
             start_date: Start date YYYY-MM-DD. Defaults to today.
         """
         await _ensure_db()
+        if (err := _check_feature_enabled()):
+            return err
         user_key = _get_user_key(garmin_client)
         date = start_date or _today()
         now = _now_utc()
@@ -234,6 +246,8 @@ def register_tools(app):
         and how many days in. Also shows the last 2 completed phases for context.
         """
         await _ensure_db()
+        if (err := _check_feature_enabled()):
+            return err
         user_key = _get_user_key(garmin_client)
 
         async with aiosqlite.connect(_db_path()) as db:
@@ -268,6 +282,8 @@ def register_tools(app):
             end_date: End date YYYY-MM-DD. Defaults to today.
         """
         await _ensure_db()
+        if (err := _check_feature_enabled()):
+            return err
         user_key = _get_user_key(garmin_client)
         date = end_date or _today()
 
@@ -310,6 +326,8 @@ def register_tools(app):
             overview: Free-text description of the week's goals and structure.
         """
         await _ensure_db()
+        if (err := _check_feature_enabled()):
+            return err
         user_key = _get_user_key(garmin_client)
         now = _now_utc()
 
@@ -344,6 +362,8 @@ def register_tools(app):
         load the current week's context.
         """
         await _ensure_db()
+        if (err := _check_feature_enabled()):
+            return err
         user_key = _get_user_key(garmin_client)
         today = _today()
 
@@ -388,6 +408,8 @@ def register_tools(app):
             end_date: End date YYYY-MM-DD.
         """
         await _ensure_db()
+        if (err := _check_feature_enabled()):
+            return err
         user_key = _get_user_key(garmin_client)
 
         async with aiosqlite.connect(_db_path()) as db:
@@ -441,6 +463,8 @@ def register_tools(app):
             plan_id: Link to a training plan ID if applicable.
         """
         await _ensure_db()
+        if (err := _check_feature_enabled()):
+            return err
         user_key = _get_user_key(garmin_client)
         now = _now_utc()
 
@@ -481,6 +505,8 @@ def register_tools(app):
             actual_activity_id: Garmin activity ID if this maps to a specific activity.
         """
         await _ensure_db()
+        if (err := _check_feature_enabled()):
+            return err
         user_key = _get_user_key(garmin_client)
         now = _now_utc()
 
@@ -523,6 +549,8 @@ def register_tools(app):
             status: Filter by status: 'planned', 'done', 'skipped', 'modified'. Optional.
         """
         await _ensure_db()
+        if (err := _check_feature_enabled()):
+            return err
         user_key = _get_user_key(garmin_client)
 
         sql = "SELECT * FROM planned_workouts WHERE user_key=?"
@@ -568,6 +596,8 @@ def register_tools(app):
             days: How many days back to look for planned workouts to match (default 14).
         """
         await _ensure_db()
+        if (err := _check_feature_enabled()):
+            return err
         user_key = _get_user_key(garmin_client)
         threshold = _auto_match_threshold()
         today = _today()
@@ -690,6 +720,8 @@ def register_tools(app):
             activity_id: Link to a Garmin activity ID if relevant.
         """
         await _ensure_db()
+        if (err := _check_feature_enabled()):
+            return err
         user_key = _get_user_key(garmin_client)
         note_date = date or _today()
         now = _now_utc()
@@ -725,6 +757,8 @@ def register_tools(app):
             limit: Max notes to return (default 50).
         """
         await _ensure_db()
+        if (err := _check_feature_enabled()):
+            return err
         user_key = _get_user_key(garmin_client)
 
         sql = "SELECT * FROM training_notes WHERE user_key=?"
@@ -768,6 +802,8 @@ def register_tools(app):
             end_date: End date YYYY-MM-DD.
         """
         await _ensure_db()
+        if (err := _check_feature_enabled()):
+            return err
         user_key = _get_user_key(garmin_client)
 
         async with aiosqlite.connect(_db_path()) as db:
@@ -867,6 +903,8 @@ def register_tools(app):
             value: Config value (always stored as string).
         """
         await _ensure_db()
+        if (err := _check_feature_enabled()):
+            return err
         user_key = _get_user_key(garmin_client)
         now = _now_utc()
 
@@ -889,6 +927,8 @@ def register_tools(app):
         the current environment-level defaults for comparison.
         """
         await _ensure_db()
+        if (err := _check_feature_enabled()):
+            return err
         user_key = _get_user_key(garmin_client)
 
         async with aiosqlite.connect(_db_path()) as db:
