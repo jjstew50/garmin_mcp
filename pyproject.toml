@@ -13,6 +13,9 @@ dependencies = [
     "garminconnect==0.3.2",
     "requests==2.33.0",
     "mcp>=1.23.0",
+    "garth>=0.5.17,<0.6.0",
+    "uvicorn>=0.30.0",
+    "aiosqlite>=0.19.0",
     "fitparse>=1.2.0",
 ]
 

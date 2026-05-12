@@ -32,13 +32,16 @@ COPY pytest.ini ./
 RUN mkdir -p /root/.garminconnect && \
     chmod 700 /root/.garminconnect
 
-# Expose the application (if needed for network communication)
-# Note: MCP servers typically communicate via stdio, so no port exposure is usually needed
-# EXPOSE 8000
+# Create directory for tracker database (mounted as Docker volume)
+RUN mkdir -p /app/data && \
+    chmod 755 /app/data
+
+# Expose HTTP port (used when MCP_TRANSPORT=sse)
+EXPOSE 8000
 
 # Set the entrypoint to run the MCP server
 ENTRYPOINT ["garmin-mcp"]
 
-# Health check (optional - adjust based on your needs)
-# HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-#   CMD python -c "import sys; sys.exit(0)"
+# Health check for hosted deployments (MCP_TRANSPORT=sse)
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:${PORT:-8000}/health')" || exit 1

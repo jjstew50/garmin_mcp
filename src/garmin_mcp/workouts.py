@@ -47,6 +47,131 @@ def _fix_hr_zone_steps(workout_data: dict) -> None:
             _fix_hr_zone_step(step)
 
 
+# =============================================================================
+# TRIDOT-STYLE WORKOUT HELPERS
+# =============================================================================
+
+# Garmin speed zone percentages relative to lactate threshold speed.
+# Zone N covers [SPEED_ZONE_FLOORS[N-1], SPEED_ZONE_FLOORS[N]) of LT speed,
+# with zone 5 having no upper bound.
+_SPEED_ZONE_PCT_FLOORS = [0.0, 0.77, 0.87, 0.94, 1.00]  # lower bound of zones 1-5
+
+
+def _get_speed_zones_mps() -> list[dict]:
+    """Derive running speed zone boundaries (m/s) from the user's lactate threshold speed.
+
+    Fetches lactateThresholdSpeed from the user profile (stored as sec/m in Garmin's API)
+    and computes zone floors using Garmin's standard LT-based percentages:
+      Zone 1: < 77% LT speed   (easy/recovery)
+      Zone 2: 77-87% LT speed  (aerobic base)
+      Zone 3: 87-94% LT speed  (tempo)
+      Zone 4: 94-100% LT speed (threshold)
+      Zone 5: > 100% LT speed  (VO2max/interval)
+
+    Returns list of 5 dicts: [{"zone": N, "min_mps": float, "max_mps": float|None}, ...]
+    """
+    profile = garmin_client.get_user_profile()
+    lt_sec_per_m = profile.get("userData", {}).get("lactateThresholdSpeed")
+    if not lt_sec_per_m or lt_sec_per_m <= 0:
+        raise ValueError("Lactate threshold speed not available in user profile")
+    lt_mps = 1.0 / lt_sec_per_m
+
+    zones = []
+    for i, floor_pct in enumerate(_SPEED_ZONE_PCT_FLOORS):
+        min_mps = round(lt_mps * floor_pct, 4)
+        max_pct = _SPEED_ZONE_PCT_FLOORS[i + 1] if i + 1 < len(_SPEED_ZONE_PCT_FLOORS) else None
+        max_mps = round(lt_mps * max_pct, 4) if max_pct is not None else None
+        zones.append({"zone": i + 1, "min_mps": min_mps, "max_mps": max_mps})
+    return zones
+
+def pace_to_mps(minutes: float, seconds: float = 0) -> float:
+    """Convert pace (min/mile) to speed in m/s.
+
+    Args:
+        minutes: Whole minutes per mile (e.g. 8 for 8:30/mile)
+        seconds: Additional seconds (e.g. 30 for 8:30/mile)
+
+    Returns:
+        Speed in meters per second
+
+    Example:
+        pace_to_mps(8, 30)  -> ~3.175  (8:30/mile)
+        pace_to_mps(9, 0)   -> ~2.987  (9:00/mile)
+    """
+    return 1609.344 / (minutes * 60 + seconds)
+
+
+def pace_km_to_mps(minutes: float, seconds: float = 0) -> float:
+    """Convert pace (min/km) to speed in m/s.
+
+    Args:
+        minutes: Whole minutes per km
+        seconds: Additional seconds
+
+    Returns:
+        Speed in meters per second
+    """
+    return 1000.0 / (minutes * 60 + seconds)
+
+
+def ftp_percent_to_watts(ftp: int, low_pct: float, high_pct: float) -> tuple:
+    """Convert FTP percentages to absolute watts.
+
+    Args:
+        ftp: Functional Threshold Power in watts
+        low_pct: Lower bound as percentage (e.g. 0.76 for 76%)
+        high_pct: Upper bound as percentage (e.g. 0.90 for 90%)
+
+    Returns:
+        Tuple of (low_watts, high_watts)
+
+    Example:
+        ftp_percent_to_watts(280, 0.76, 0.90) -> (213, 252)
+    """
+    return (round(ftp * low_pct), round(ftp * high_pct))
+
+
+def _make_step(
+    step_order: int,
+    duration_seconds: float,
+    target_type_id: int,
+    target_type_key: str,
+    target_low: float = 0.0,
+    target_high: float = 0.0,
+    description: str = None,
+    step_type_id: int = 7,
+    step_type_key: str = "other",
+    zone_number: int = None,
+) -> dict:
+    """Build a single ExecutableStepDTO for a Garmin workout.
+
+    Used internally by upload_running_workout() and upload_cycling_workout()
+    to build each flat time-based step.
+
+    For zone-based targets (pace_zone, heart_rate_zone), pass zone_number instead
+    of target_low/target_high — Garmin uses zoneNumber (1-5) for these.
+    """
+    step = {
+        "type": "ExecutableStepDTO",
+        "stepOrder": step_order,
+        "stepType": {"stepTypeId": step_type_id, "stepTypeKey": step_type_key},
+        "endCondition": {"conditionTypeId": 2, "conditionTypeKey": "time"},
+        "endConditionValue": float(duration_seconds),
+        "targetType": {
+            "workoutTargetTypeId": target_type_id,
+            "workoutTargetTypeKey": target_type_key,
+        },
+    }
+    if zone_number is not None:
+        step["zoneNumber"] = zone_number
+    else:
+        step["targetValueOne"] = float(target_low)
+        step["targetValueTwo"] = float(target_high)
+    if description:
+        step["description"] = description
+    return step
+
+
 def _curate_workout_summary(workout: dict) -> dict:
     """Extract essential workout metadata for list views"""
     sport_type = workout.get('sportType', {})
@@ -481,6 +606,273 @@ def register_tools(app):
             return f"Error uploading workout: {str(e)}"
 
     @app.tool()
+    async def upload_running_workout(
+        name: str,
+        steps: list,
+        description: str = None,
+        estimated_duration_seconds: int = None,
+    ) -> str:
+        """Upload a structured running workout to Garmin Connect.
+
+        Higher-level helper than upload_workout(). Accepts a simplified flat step list
+        with typed targets and builds the correct Garmin API payload automatically.
+        Steps are always time-based (no distance-based steps).
+
+        Each step in `steps` is a dict with these fields:
+          - duration_seconds (int, required): Length of step in seconds
+          - target (dict, required): One of:
+              {"type": "speed", "min_mps": float, "max_mps": float}      — absolute speed range
+              {"type": "speed_zone", "zone": int}                        — personal speed zone 1-5 (auto-fetches LT speed)
+              {"type": "heart_rate", "min_bpm": float, "max_bpm": float} — absolute BPM range
+              {"type": "heart_rate_zone", "zone": int}                   — Garmin HR zone 1-5
+              {"type": "none"}
+          - description (str, optional): Label shown on watch (e.g. "Threshold", "Recovery")
+
+        HR zone reference:
+          Zone 1: easy/recovery   Zone 2: aerobic   Zone 3: tempo
+          Zone 4: threshold       Zone 5: max effort
+
+        Absolute speed reference (m/s ↔ min/mile):
+          2.51 m/s ≈ 10:41/mile (easy)    3.21 m/s ≈ 8:21/mile (threshold lower)
+          2.68 m/s ≈ 10:00/mile           3.50 m/s ≈ 7:40/mile (threshold upper)
+          2.87 m/s ≈  9:21/mile
+
+        Use pace_to_mps(minutes, seconds) to convert, e.g. pace_to_mps(8, 30) -> 3.175 m/s
+
+        **Templates:**
+        - workout://templates/tridot-run — example Threshold Repeats workout
+
+        Example (mixing zone and absolute targets):
+            steps = [
+                {"duration_seconds": 600, "target": {"type": "heart_rate_zone", "zone": 2}},
+                {"duration_seconds": 360, "target": {"type": "speed", "min_mps": 3.21, "max_mps": 3.50},
+                 "description": "Threshold"},
+                {"duration_seconds": 120, "target": {"type": "heart_rate_zone", "zone": 1},
+                 "description": "Recovery"},
+            ]
+
+        Args:
+            name: Workout name (e.g. "2025-11-12 Threshold Repeats")
+            steps: List of step dicts (see above)
+            description: Optional workout description text
+            estimated_duration_seconds: Optional total duration hint; auto-calculated from steps if omitted
+        """
+        try:
+            SPEED_TARGET_TYPE_ID = 5    # workoutTargetTypeId for "speed.zone" (absolute m/s range)
+            SPEED_TARGET_TYPE_KEY = "speed.zone"
+            HR_TARGET_TYPE_ID = 4       # workoutTargetTypeId for "heart.rate.zone"
+            NO_TARGET_TYPE_ID = 1       # workoutTargetTypeId for "no.target"
+            STEP_TYPE_ID_OTHER = 7      # stepTypeId for "other"
+
+            sport_type = {"sportTypeId": 1, "sportTypeKey": "running"}
+
+            # Fetch speed zones once if any step uses speed_zone
+            speed_zones_cache = None
+            if any(s.get("target", {}).get("type") == "speed_zone" for s in steps):
+                speed_zones_cache = {z["zone"]: z for z in _get_speed_zones_mps()}
+
+            workout_steps = []
+            for i, step in enumerate(steps):
+                target = step.get("target", {"type": "none"})
+                target_type = target.get("type", "none")
+                zone_number = None
+
+                if target_type == "speed":
+                    target_id = SPEED_TARGET_TYPE_ID
+                    target_key = SPEED_TARGET_TYPE_KEY
+                    target_low = target["min_mps"]
+                    target_high = target["max_mps"]
+                elif target_type == "speed_zone":
+                    z = speed_zones_cache[target["zone"]]
+                    target_id = SPEED_TARGET_TYPE_ID
+                    target_key = SPEED_TARGET_TYPE_KEY
+                    target_low = z["min_mps"]
+                    target_high = z["max_mps"] if z["max_mps"] is not None else z["min_mps"] * 1.15
+                elif target_type == "heart_rate":
+                    target_id = HR_TARGET_TYPE_ID
+                    target_key = "heart.rate.zone"
+                    target_low = target["min_bpm"]
+                    target_high = target["max_bpm"]
+                elif target_type == "heart_rate_zone":
+                    target_id = HR_TARGET_TYPE_ID
+                    target_key = "heart.rate.zone"
+                    zone_number = target["zone"]
+                    target_low = target_high = 0.0
+                else:
+                    target_id = NO_TARGET_TYPE_ID
+                    target_key = "no.target"
+                    target_low = target_high = 0.0
+
+                workout_steps.append(_make_step(
+                    step_order=i + 1,
+                    duration_seconds=step["duration_seconds"],
+                    target_type_id=target_id,
+                    target_type_key=target_key,
+                    target_low=target_low,
+                    target_high=target_high,
+                    description=step.get("description"),
+                    step_type_id=STEP_TYPE_ID_OTHER,
+                    step_type_key="other",
+                    zone_number=zone_number,
+                ))
+
+            workout_data = {
+                "workoutName": name,
+                "sportType": sport_type,
+                "workoutSegments": [{
+                    "segmentOrder": 1,
+                    "sportType": sport_type,
+                    "workoutSteps": workout_steps,
+                }],
+                "estimatedDuration": estimated_duration_seconds if estimated_duration_seconds
+                    else sum(s["duration_seconds"] for s in steps),
+            }
+
+            if description:
+                workout_data["description"] = description
+
+            result = garmin_client.upload_workout(workout_data)
+
+            if isinstance(result, dict):
+                return json.dumps({
+                    "status": "success",
+                    "workout_id": result.get("workoutId"),
+                    "name": result.get("workoutName"),
+                    "steps_uploaded": len(steps),
+                    "message": "Running workout uploaded successfully",
+                }, indent=2)
+
+            return json.dumps(result, indent=2)
+        except Exception as e:
+            return f"Error uploading running workout: {str(e)}"
+
+    @app.tool()
+    async def upload_cycling_workout(
+        name: str,
+        steps: list,
+        description: str = None,
+        estimated_duration_seconds: int = None,
+    ) -> str:
+        """Upload a structured cycling workout to Garmin Connect.
+
+        Higher-level helper than upload_workout(). Accepts a simplified flat step list
+        with typed targets and builds the correct Garmin API payload automatically.
+        Steps are always time-based (no distance-based steps).
+
+        Each step in `steps` is a dict with these fields:
+          - duration_seconds (int, required): Length of step in seconds
+          - target (dict, required): One of:
+              {"type": "power", "min_watts": float, "max_watts": float}   — absolute watts range
+              {"type": "heart_rate", "min_bpm": float, "max_bpm": float}  — absolute BPM range
+              {"type": "heart_rate_zone", "zone": int}                    — Garmin HR zone 1-5
+              {"type": "none"}
+          - description (str, optional): Label shown on watch (e.g. "Spinup!", "Cadence @ 90 rpm")
+
+        Power zone reference (example based on FTP ~280W):
+          Easy/recovery:   174–214W  (~62–76% FTP)
+          Tempo:           217–257W  (~77–92% FTP)
+          Threshold:       259–299W  (~92–107% FTP)
+          Above threshold: 302–342W  (~108–122% FTP)
+
+        Use ftp_percent_to_watts(ftp, low_pct, high_pct) to calculate, e.g.
+        ftp_percent_to_watts(280, 0.92, 1.07) -> (258, 300)
+
+        **Templates:**
+        - workout://templates/tridot-cycling — example Threshold Intervals workout
+
+        Example:
+            steps = [
+                {"duration_seconds": 300, "target": {"type": "heart_rate", "min_bpm": 101, "max_bpm": 122},
+                 "description": "Spinup!"},
+                {"duration_seconds": 960, "target": {"type": "power", "min_watts": 259, "max_watts": 299},
+                 "description": "Cadence @ 80 rpm"},
+                {"duration_seconds": 600, "target": {"type": "power", "min_watts": 174, "max_watts": 214}},
+            ]
+
+        Args:
+            name: Workout name (e.g. "2025-11-10 Threshold Intervals")
+            steps: List of step dicts (see above)
+            description: Optional workout description text
+            estimated_duration_seconds: Optional total duration hint; auto-calculated from steps if omitted
+        """
+        try:
+            POWER_TARGET_TYPE_ID = 2    # workoutTargetTypeId for "power.zone" (absolute watts range)
+            HR_TARGET_TYPE_ID = 4       # workoutTargetTypeId for "heart.rate.zone"
+            NO_TARGET_TYPE_ID = 1       # workoutTargetTypeId for "no.target"
+            STEP_TYPE_ID_OTHER = 7      # stepTypeId for "other"
+
+            sport_type = {"sportTypeId": 2, "sportTypeKey": "cycling"}
+
+            workout_steps = []
+            for i, step in enumerate(steps):
+                target = step.get("target", {"type": "none"})
+                target_type = target.get("type", "none")
+                zone_number = None
+
+                if target_type == "power":
+                    target_id = POWER_TARGET_TYPE_ID
+                    target_key = "power.zone"
+                    target_low = target["min_watts"]
+                    target_high = target["max_watts"]
+                elif target_type == "heart_rate":
+                    target_id = HR_TARGET_TYPE_ID
+                    target_key = "heart.rate.zone"
+                    target_low = target["min_bpm"]
+                    target_high = target["max_bpm"]
+                elif target_type == "heart_rate_zone":
+                    target_id = HR_TARGET_TYPE_ID
+                    target_key = "heart.rate.zone"
+                    zone_number = target["zone"]
+                    target_low = target_high = 0.0
+                else:
+                    target_id = NO_TARGET_TYPE_ID
+                    target_key = "no.target"
+                    target_low = target_high = 0.0
+
+                workout_steps.append(_make_step(
+                    step_order=i + 1,
+                    duration_seconds=step["duration_seconds"],
+                    target_type_id=target_id,
+                    target_type_key=target_key,
+                    target_low=target_low,
+                    target_high=target_high,
+                    description=step.get("description"),
+                    step_type_id=STEP_TYPE_ID_OTHER,
+                    step_type_key="other",
+                    zone_number=zone_number,
+                ))
+
+            workout_data = {
+                "workoutName": name,
+                "sportType": sport_type,
+                "workoutSegments": [{
+                    "segmentOrder": 1,
+                    "sportType": sport_type,
+                    "workoutSteps": workout_steps,
+                }],
+                "estimatedDuration": estimated_duration_seconds if estimated_duration_seconds
+                    else sum(s["duration_seconds"] for s in steps),
+            }
+
+            if description:
+                workout_data["description"] = description
+
+            result = garmin_client.upload_workout(workout_data)
+
+            if isinstance(result, dict):
+                return json.dumps({
+                    "status": "success",
+                    "workout_id": result.get("workoutId"),
+                    "name": result.get("workoutName"),
+                    "steps_uploaded": len(steps),
+                    "message": "Cycling workout uploaded successfully",
+                }, indent=2)
+
+            return json.dumps(result, indent=2)
+        except Exception as e:
+            return f"Error uploading cycling workout: {str(e)}"
+
+    @app.tool()
     async def upload_workouts(workouts: list[dict]) -> str:
         """Upload multiple workouts from JSON data in a single call
 
@@ -730,6 +1122,83 @@ def register_tools(app):
                 }, indent=2)
         except Exception as e:
             return f"Error scheduling workout: {str(e)}"
+
+    @app.tool()
+    async def get_user_zones() -> str:
+        """Get your personal HR and running speed zones from Garmin Connect.
+
+        Returns:
+        - Heart rate zones (floors in BPM) from your Garmin profile
+        - Running speed zones derived from your lactate threshold speed
+          (also shown as min/mile and min/km pace for reference)
+
+        Speed zones are computed from your lactate threshold speed using
+        Garmin's standard LT-based percentages:
+          Zone 1 (Easy/Recovery): < 77% LT speed
+          Zone 2 (Aerobic Base):  77-87% LT speed
+          Zone 3 (Tempo):         87-94% LT speed
+          Zone 4 (Threshold):     94-100% LT speed
+          Zone 5 (VO2max):       > 100% LT speed
+
+        These zones can be used directly with upload_running_workout() via
+        the "speed_zone" target type: {"type": "speed_zone", "zone": 1-5}
+        """
+        try:
+            # HR zones
+            hr_zones_raw = garmin_client.garth.get(
+                "connectapi", "biometric-service/heartRateZones"
+            ).json()
+            default_hr = next(
+                (z for z in hr_zones_raw if z.get("sport") == "DEFAULT"), hr_zones_raw[0]
+            )
+            hr_floors = [
+                default_hr["zone1Floor"],
+                default_hr["zone2Floor"],
+                default_hr["zone3Floor"],
+                default_hr["zone4Floor"],
+                default_hr["zone5Floor"],
+            ]
+            max_hr = default_hr["maxHeartRateUsed"]
+            hr_zones = []
+            for i, floor in enumerate(hr_floors):
+                ceiling = hr_floors[i + 1] - 1 if i + 1 < len(hr_floors) else max_hr
+                hr_zones.append({"zone": i + 1, "min_bpm": floor, "max_bpm": ceiling})
+
+            # Speed zones from LT
+            speed_zones_mps = _get_speed_zones_mps()
+            speed_zones = []
+            for z in speed_zones_mps:
+                entry = {"zone": z["zone"], "min_mps": z["min_mps"]}
+                if z["max_mps"] is not None:
+                    entry["max_mps"] = z["max_mps"]
+                # Add pace reference
+                if z["min_mps"] > 0:
+                    min_pace_mile = 1609.344 / z["min_mps"] / 60
+                    m, s = divmod(min_pace_mile * 60, 60)
+                    entry["min_pace_per_mile"] = f"{int(m)}:{int(s):02d}"
+                if z["max_mps"]:
+                    max_pace_mile = 1609.344 / z["max_mps"] / 60
+                    m, s = divmod(max_pace_mile * 60, 60)
+                    entry["max_pace_per_mile"] = f"{int(m)}:{int(s):02d}"
+                speed_zones.append(entry)
+
+            profile = garmin_client.get_user_profile()
+            lt_sec_per_m = profile.get("userData", {}).get("lactateThresholdSpeed")
+            lt_mps = round(1.0 / lt_sec_per_m, 3) if lt_sec_per_m else None
+            lt_hr = profile.get("userData", {}).get("lactateThresholdHeartRate")
+
+            return json.dumps({
+                "lactate_threshold": {
+                    "speed_mps": lt_mps,
+                    "heart_rate_bpm": lt_hr,
+                },
+                "heart_rate_zones": hr_zones,
+                "speed_zones": speed_zones,
+                "note": "Speed zones are derived from LT speed using Garmin standard percentages. "
+                        "Use {'type': 'speed_zone', 'zone': N} in upload_running_workout().",
+            }, indent=2)
+        except Exception as e:
+            return f"Error retrieving user zones: {str(e)}"
 
     @app.tool()
     async def schedule_workouts(schedules: list[dict]) -> str:
