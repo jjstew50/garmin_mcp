@@ -9,13 +9,14 @@ description = "MCP server to access Garmin data"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "python-dotenv==1.0.1",
-    "garminconnect==0.2.38",
-    "requests==2.32.4",
+    "python-dotenv==1.2.2",
+    "garminconnect==0.3.2",
+    "requests==2.33.0",
     "mcp>=1.23.0",
     "garth>=0.5.17,<0.6.0",
     "uvicorn>=0.30.0",
     "aiosqlite>=0.19.0",
+    "fitparse>=1.2.0",
 ]
 
 [project.scripts]
@@ -30,5 +31,3 @@ dev-dependencies = [
     "pytest-timeout>=2.3.1",
 ]
 
-[tool.uv.sources]
-garmin-mcp = { workspace = true }

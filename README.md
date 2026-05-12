@@ -10,20 +10,26 @@ Garmin's API is accessed via the awesome [python-garminconnect](https://github.c
 
 - List recent activities with pagination support
 - Get detailed activity information
+- Manage activity names
 - Access health metrics (steps, heart rate, sleep, stress, respiration)
 - View body composition data
 - Track training status and readiness
+- Access cycling FTP and lactate threshold metrics
 - Manage gear and equipment
 - Access workouts and training plans
+- Inspect detailed workout step structures, including repeat groups and swim pace targets
 - Weekly health aggregates (steps, stress, intensity minutes)
+- Advanced cycling analytics: power zones, FIT file analysis, DI2 electronic shift intelligence
+- Training load trend (CTL/ATL/TSB), HRV trend, VO2 max trend, respiration rate trend
+- Power Duration Curve, climb detection with VAM, cardiac drift (aerobic decoupling), W/kg calculations
 
 ### Tool Coverage
 
-This MCP server implements **96+ tools** covering ~89% of the [python-garminconnect](https://github.com/cyberjunky/python-garminconnect) library (v0.2.38):
+This MCP server implements **110+ tools** covering ~90% of the [python-garminconnect](https://github.com/cyberjunky/python-garminconnect) library (v0.3.2):
 
-- ✅ Activity Management (14 tools)
+- ✅ Activity Management (15 tools)
 - ✅ Health & Wellness (31 tools) - includes custom lightweight summary tools
-- ✅ Training & Performance (9 tools)
+- ✅ Training & Performance (13 tools) - includes CTL/ATL/TSB, HRV, VO2 max, and respiration trends
 - ✅ Workouts (8 tools)
 - ✅ Devices (7 tools)
 - ✅ Gear Management (5 tools)
@@ -32,6 +38,11 @@ This MCP server implements **96+ tools** covering ~89% of the [python-garminconn
 - ✅ Nutrition (8 tools) - food logs, meals, custom foods, and food logging
 - ✅ Women's Health (3 tools)
 - ✅ User Profile (3 tools)
+- ✅ High-Level Workout Builders (4 tools) - create and schedule workouts without writing JSON
+- ✅ Courses (3 tools) - list / upload GPX as course / delete course
+- ✅ Activity Analysis (2 tools) - FIT file parsing, Power Duration Curve; requires power meter and/or Di2
+
+> **Note:** Activity Analysis tools require a compatible power meter (e.g., Garmin Rally, Favero Assioma, PowerTap P1) and/or Shimano Di2 / SRAM eTap electronic shifting. The `fitparse` dependency is installed automatically.
 
 ### Intentionally Skipped Endpoints
 
@@ -48,6 +59,118 @@ Some endpoints are not implemented due to performance or complexity consideratio
 - Internal/Auth methods: `login()`, `resume_login()`, `connectapi()`, `download()` - Handled automatically by the library.
 
 If you need any of these endpoints, please [open an issue](https://github.com/Taxuspt/garmin_mcp/issues).
+
+## High-level workout tools
+
+These builder tools let an LLM create and schedule workouts without writing raw Garmin JSON.
+
+### `create_walk_run_workout`
+
+Creates a walk/run interval workout with optional heart-rate zone target.
+
+```json
+{
+  "name": "W3 Mié 2:2",
+  "run_seconds": 120,
+  "walk_seconds": 120,
+  "repeats": 9,
+  "warmup_min": 10,
+  "cooldown_min": 8,
+  "hr_zone": "Z3"
+}
+```
+
+Returns: `{"status": "success", "workout_id": 1234567890, ...}`
+
+### `create_z2_walk_workout`
+
+Creates a steady Z2 walking workout.
+
+```json
+{
+  "name": "Z2 Walk 45m",
+  "duration_min": 45,
+  "hr_min": 110,
+  "hr_max": 130
+}
+```
+
+Returns: `{"status": "success", "workout_id": 1234567890, ...}`
+
+### `create_strength_workout`
+
+Creates a strength workout from a list of exercises. Unknown names fall back to a generic step with the original name preserved.
+
+```json
+{
+  "name": "Full Body A",
+  "exercises": [
+    {"name": "Sentadillas", "sets": 3, "reps": 12, "rest_seconds": 90},
+    {"name": "Flexiones",   "sets": 3, "reps": 15, "rest_seconds": 60},
+    {"name": "Peso muerto", "sets": 3, "reps": 10, "rest_seconds": 90}
+  ]
+}
+```
+
+Returns: `{"status": "success", "workout_id": 1234567890, ...}`
+
+### `schedule_week`
+
+Schedules multiple workouts in one call.
+
+```json
+{
+  "week": [
+    {"date": "2026-05-12", "workout_id": 1234567890},
+    {"date": "2026-05-14", "workout_id": 1234567891}
+  ]
+}
+```
+
+Returns: `{"status": "complete", "scheduled": [...]}`
+
+### Full flow example
+
+```text
+create_walk_run_workout(name="W3 Mié 2:2", run_seconds=120, walk_seconds=120,
+                        repeats=9, warmup_min=10, cooldown_min=8)
+  → workout_id = 1560092011
+
+schedule_workout(workout_id=1560092011, date="2026-05-06")
+  → OK
+```
+
+After syncing your watch, the workout appears on the Forerunner 965 calendar.
+
+## One-click Install (Claude Desktop)
+
+The easiest way to add this server to Claude Desktop is via the `.dxt` Desktop Extension file — no JSON editing required.
+
+### Download and install
+
+1. Download the latest `garmin-mcp.dxt` from the [Releases page](https://github.com/Taxuspt/garmin_mcp/releases).
+2. Drag the `.dxt` file into the Claude Desktop window, **or** double-click it, **or** go to **Settings → Extensions → Install Extension** and select the file.
+3. Claude Desktop will prompt you for optional configuration (token path, email, password).
+
+### First-time authentication
+
+The extension installs and runs the server automatically, but you must authenticate with Garmin once before data can be fetched:
+
+```bash
+uvx --python 3.12 --from git+https://github.com/Taxuspt/garmin_mcp garmin-mcp-auth
+```
+
+This saves OAuth tokens to `~/.garminconnect`. After that the server works without any credentials in the config.
+
+> **Note:** Tokens are valid for approximately 6 months. Re-run `garmin-mcp-auth` when they expire.
+
+### Build the `.dxt` yourself
+
+```bash
+bash scripts/build_dxt.sh   # produces garmin-mcp.dxt in the repo root
+```
+
+---
 
 ## Setup
 
@@ -382,6 +505,12 @@ Once connected in Claude, you can ask questions like:
 - "What was my sleep like last night?"
 - "How many steps did I take yesterday?"
 - "Show me the details of my latest run"
+- "Analyze my last ride's power zones and compare to my training zones"
+- "Show me my CTL, ATL, and TSB trend for the last 6 weeks"
+- "What was my power duration curve from yesterday's ride? Estimate my FTP."
+- "Analyze the FIT data from my last cycling activity — how was my shifting quality on the climbs?"
+- "Show me my HRV trend for the last 2 weeks and flag any recovery concerns"
+- "What's my season best 20-minute power and when did I set it?"
 
 ## Troubleshooting
 
@@ -545,5 +674,13 @@ uv run pytest tests/e2e/ -m e2e -v
 
 ### Test Structure
 
-- **Integration tests** (130 tests): Test all MCP tools using FastMCP integration with mocked Garmin API responses
+- **Integration tests** (200+ tests): Test all MCP tools using FastMCP integration with mocked Garmin API responses
 - **End-to-end tests** (4 tests): Test with real MCP server and Garmin API (requires valid credentials)
+
+## Reinstalling from local path
+
+If you are working from a local checkout or fork:
+
+```bash
+uv tool install --python 3.12 --force C:\Users\aresd\Desktop\programacion\garmin_mcp
+```

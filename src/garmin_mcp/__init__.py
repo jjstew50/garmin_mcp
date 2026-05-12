@@ -12,7 +12,7 @@ import requests
 from mcp.server.fastmcp import FastMCP
 
 from garth.exc import GarthHTTPError
-from garminconnect import Garmin, GarminConnectAuthenticationError, GarminConnectConnectionError
+from garminconnect import Garmin, GarminConnectAuthenticationError, GarminConnectConnectionError, GarminConnectTooManyRequestsError
 
 # Import core Garmin modules (always enabled)
 from garmin_mcp import activity_management
@@ -28,6 +28,9 @@ from garmin_mcp import workout_templates
 from garmin_mcp import data_management
 from garmin_mcp import womens_health
 from garmin_mcp import nutrition
+from garmin_mcp import workout_builders
+from garmin_mcp import courses
+from garmin_mcp import activity_analysis
 from garmin_mcp.context import _active_user_features
 
 # tracker and training_memory are imported conditionally inside main() after
@@ -180,7 +183,7 @@ def init_api(
             sys.stderr = old_stderr
         print("Login successful via token files.", file=sys.stderr)
         return garmin
-    except (FileNotFoundError, GarthHTTPError, GarminConnectAuthenticationError):
+    except (FileNotFoundError, GarthHTTPError, GarminConnectAuthenticationError, GarminConnectConnectionError, GarminConnectTooManyRequestsError):
         pass
 
     # 3. Re-auth with email + password
@@ -314,6 +317,9 @@ def _configure_and_build_app(
     data_management.configure(garmin_client)
     womens_health.configure(garmin_client)
     nutrition.configure(garmin_client)
+    workout_builders.configure(garmin_client)
+    courses.configure(garmin_client)
+    activity_analysis.configure(garmin_client)
 
     if tracker:
         tracker.configure(garmin_client)
@@ -333,6 +339,9 @@ def _configure_and_build_app(
     app = data_management.register_tools(app)
     app = womens_health.register_tools(app)
     app = nutrition.register_tools(app)
+    app = workout_builders.register_tools(app)
+    app = courses.register_tools(app)
+    app = activity_analysis.register_tools(app)
 
     if tracker:
         app = tracker.register_tools(app)

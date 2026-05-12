@@ -77,6 +77,64 @@ MOCK_ACTIVITY_SPLITS = {
     ]
 }
 
+MOCK_SWIM_ACTIVITY_SPLITS = {
+    "activityId": 22526515067,
+    "lapDTOs": [
+        {
+            "lapIndex": 1,
+            "startTimeGMT": "2026-04-14T17:19:08.0",
+            "distance": 2024.0,
+            "duration": 2995.565,
+            "movingDuration": 2995.565,
+            "elapsedDuration": 2995.565,
+            "averageSpeed": 0.6759999990463257,
+            "averageMovingSpeed": 0.67566553875138,
+            "maxSpeed": 0.7689999938011169,
+            "calories": 552.0,
+            "bmrCalories": 85.0,
+            "averageHR": 136.0,
+            "maxHR": 152.0,
+            "averageSwimCadence": 22.0,
+            "numberOfActiveLengths": 92,
+            "totalNumberOfStrokes": 1104,
+            "averageStrokes": 12.0,
+            "averageSWOLF": 45.0,
+            "averageStrokeDistance": 0.0,
+            "wktStepIndex": 0,
+            "lengthDTOs": [
+                {
+                    "lengthIndex": 1,
+                    "startTimeGMT": "2026-04-14T17:19:08.0",
+                    "distance": 22.0,
+                    "duration": 31.0,
+                    "averageSpeed": 0.7099999785423279,
+                    "maxSpeed": 0.7099999785423279,
+                    "calories": 6.0,
+                    "averageHR": 121.0,
+                    "maxHR": 134.0,
+                    "totalNumberOfStrokes": 11,
+                    "averageSWOLF": 42.0,
+                    "swimStroke": "FREESTYLE",
+                },
+                {
+                    "lengthIndex": 2,
+                    "startTimeGMT": "2026-04-14T17:19:39.0",
+                    "distance": 22.0,
+                    "duration": 31.125,
+                    "averageSpeed": 0.7070000171661376,
+                    "maxSpeed": 0.7070000171661376,
+                    "calories": 6.0,
+                    "averageHR": 135.0,
+                    "maxHR": 142.0,
+                    "totalNumberOfStrokes": 12,
+                    "averageSWOLF": 43.0,
+                    "swimStroke": "FREESTYLE",
+                },
+            ],
+        }
+    ],
+}
+
 # Health & Wellness
 MOCK_STATS = {
     "totalKilocalories": 2500,
@@ -623,6 +681,74 @@ MOCK_WORKOUT_DETAILS = {
     ]
 }
 
+MOCK_SWIM_WORKOUT_DETAILS = {
+    "workoutId": 1528077786,
+    "workoutName": "Long Swim - intermittent 1000m",
+    "description": "Example swim workout with Garmin secondary pace targets",
+    "sportType": {"sportTypeId": 4, "sportTypeKey": "swimming"},
+    "estimatedDistanceInMeters": 3000.0,
+    "createdDate": "2026-04-06T12:37:29.0",
+    "updatedDate": "2026-04-07T09:59:49.0",
+    "workoutSegments": [
+        {
+            "segmentOrder": 1,
+            "sportType": {"sportTypeId": 4, "sportTypeKey": "swimming"},
+            "workoutSteps": [
+                {
+                    "type": "ExecutableStepDTO",
+                    "stepId": 12984228432,
+                    "stepOrder": 1,
+                    "stepType": {"stepTypeId": 1, "stepTypeKey": "warmup"},
+                    "description": "2:24-3:42/100m",
+                    "endCondition": {"conditionTypeId": 3, "conditionTypeKey": "distance"},
+                    "endConditionValue": 500.0,
+                    "targetType": None,
+                    "secondaryTargetType": {
+                        "workoutTargetTypeId": 6,
+                        "workoutTargetTypeKey": "pace.zone",
+                    },
+                    "secondaryTargetValueOne": 0.45,
+                    "secondaryTargetValueTwo": 0.6916667,
+                },
+                {
+                    "type": "RepeatGroupDTO",
+                    "stepId": 12984228433,
+                    "stepOrder": 2,
+                    "stepType": {"stepTypeId": 6, "stepTypeKey": "repeat"},
+                    "numberOfIterations": 2,
+                    "workoutSteps": [
+                        {
+                            "type": "ExecutableStepDTO",
+                            "stepId": 12984228434,
+                            "stepOrder": 3,
+                            "stepType": {"stepTypeId": 3, "stepTypeKey": "interval"},
+                            "description": "1:56-2:09/100m",
+                            "endCondition": {"conditionTypeId": 3, "conditionTypeKey": "distance"},
+                            "endConditionValue": 1000.0,
+                            "targetType": None,
+                            "secondaryTargetType": {
+                                "workoutTargetTypeId": 6,
+                                "workoutTargetTypeKey": "pace.zone",
+                            },
+                            "secondaryTargetValueOne": 0.7751938,
+                            "secondaryTargetValueTwo": 0.8583333,
+                        },
+                        {
+                            "type": "ExecutableStepDTO",
+                            "stepId": 12984228435,
+                            "stepOrder": 4,
+                            "stepType": {"stepTypeId": 5, "stepTypeKey": "rest"},
+                            "endCondition": {"conditionTypeId": 8, "conditionTypeKey": "fixed.rest"},
+                            "endConditionValue": 60.0,
+                            "targetType": None,
+                        },
+                    ],
+                },
+            ],
+        }
+    ],
+}
+
 # Women's Health
 MOCK_MENSTRUAL_DATA = {
     "calendarDate": "2024-01-15",
@@ -809,4 +935,15 @@ MOCK_LACTATE_THRESHOLD_RANGE = {
     "power": [
         {"from": "2024-01-15", "until": "2024-01-15", "series": "running", "value": 334.0, "updatedDate": "2024-01-15"},
     ],
+}
+
+MOCK_CYCLING_FTP = {
+    "userProfilePK": 12345678,
+    "version": 1710498600000,
+    "calendarDate": "2024-03-15T10:30:00.000",
+    "isStale": False,
+    "sequence": 1710498600000,
+    "sport": "CYCLING",
+    "functionalThresholdPower": 294,
+    "biometricSourceType": "CHANGE_LOG",
 }
