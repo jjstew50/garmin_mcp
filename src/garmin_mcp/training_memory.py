@@ -151,7 +151,10 @@ def _today() -> str:
 
 
 def _get_user_key(client) -> str:
-    key = getattr(client, "username", None) or getattr(client, "display_name", None)
+    from garmin_mcp.context import _active_user_key
+    key = _active_user_key.get(None)
+    if not key:
+        key = getattr(client, "username", None) or getattr(client, "display_name", None)
     if not key:
         raise RuntimeError("Cannot determine user identity")
     return key

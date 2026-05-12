@@ -122,9 +122,15 @@ def _now_utc() -> str:
 
 
 def _get_user_key(client) -> str:
-    key = getattr(client, "username", None) or getattr(client, "display_name", None)
+    # In SSE mode the Bearer token (API key) is the canonical per-user key — it's
+    # guaranteed unique and set by the ASGI middleware before any tool runs.
+    # Fall back to display_name only in stdio/single-user mode where the ContextVar is unset.
+    from garmin_mcp.context import _active_user_key
+    key = _active_user_key.get(None)
     if not key:
-        raise RuntimeError("Cannot determine user identity: username and display_name both unavailable")
+        key = getattr(client, "username", None) or getattr(client, "display_name", None)
+    if not key:
+        raise RuntimeError("Cannot determine user identity: no active user key and display_name unavailable")
     return key
 
 

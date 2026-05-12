@@ -88,10 +88,20 @@ class GarminOAuthProvider(OAuthAuthorizationServerProvider[GarminAuthCode, Refre
             refresh_token=authorization_code.api_key,
         )
 
+    def _is_valid_key(self, token: str) -> bool:
+        """Check static startup set first (fast), then live DB (picks up new users)."""
+        if token in self._api_keys:
+            return True
+        try:
+            from garmin_mcp.users_db import get_user_by_key
+            return get_user_by_key(token) is not None
+        except Exception:
+            return False
+
     async def load_refresh_token(
         self, client: OAuthClientInformationFull, refresh_token: str
     ) -> RefreshToken | None:
-        if refresh_token in self._api_keys:
+        if self._is_valid_key(refresh_token):
             return RefreshToken(token=refresh_token, client_id=client.client_id, scopes=[])
         return None
 
@@ -106,7 +116,7 @@ class GarminOAuthProvider(OAuthAuthorizationServerProvider[GarminAuthCode, Refre
         )
 
     async def load_access_token(self, token: str) -> AccessToken | None:
-        if token in self._api_keys:
+        if self._is_valid_key(token):
             return AccessToken(token=token, client_id="garmin-user", scopes=[])
         return None
 
@@ -119,9 +129,10 @@ class GarminOAuthProvider(OAuthAuthorizationServerProvider[GarminAuthCode, Refre
 
         async def authorize_form(request: Request) -> Response:
             if request.method == "GET":
+                import html as _html
                 encoded = request.query_params.get("p", "")
                 error = request.query_params.get("error", "")
-                error_html = f'<p class="error">{error}</p>' if error else ""
+                error_html = f'<p class="error">{_html.escape(error)}</p>' if error else ""
                 return HTMLResponse(_FORM_HTML.format(encoded_params=encoded, error_html=error_html))
 
             # POST: validate key and redirect back to Claude
@@ -134,10 +145,10 @@ class GarminOAuthProvider(OAuthAuthorizationServerProvider[GarminAuthCode, Refre
             except Exception:
                 return HTMLResponse("Invalid request", status_code=400)
 
-            if api_key not in provider._api_keys:
+            if not provider._is_valid_key(api_key):
                 from urllib.parse import quote
                 return RedirectResponse(
-                    f"/authorize-form?p={encoded}&error={quote('Invalid API key — check with Jason')}",
+                    f"/authorize-form?p={encoded}&error={quote('Invalid API key. Contact the server administrator.')}",
                     status_code=302,
                 )
 

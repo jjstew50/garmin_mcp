@@ -3,7 +3,6 @@ Modular MCP Server for Garmin Connect Data
 """
 
 import io
-import json
 import os
 import sys
 from contextvars import ContextVar
@@ -11,7 +10,6 @@ from contextvars import ContextVar
 import requests
 from mcp.server.fastmcp import FastMCP
 
-from garth.exc import GarthHTTPError
 from garminconnect import Garmin, GarminConnectAuthenticationError, GarminConnectConnectionError, GarminConnectTooManyRequestsError
 
 # Import core Garmin modules (always enabled)
@@ -31,7 +29,7 @@ from garmin_mcp import nutrition
 from garmin_mcp import workout_builders
 from garmin_mcp import courses
 from garmin_mcp import activity_analysis
-from garmin_mcp.context import _active_user_features
+from garmin_mcp.context import _active_user_features, _active_user_key
 
 # tracker and training_memory are imported conditionally inside main() after
 # MCP_USERS is parsed, so per-user "training_memory" flags can drive the decision.
@@ -47,21 +45,58 @@ from garmin_mcp.context import _active_user_features
 # ---------------------------------------------------------------------------
 
 _active_client: ContextVar[Garmin] = ContextVar("active_garmin_client")
-# _active_user_features is imported from context.py (shared with training_memory)
+# _active_user_features / _active_user_key are imported from context.py
+
+# Module-level state shared between the proxy, background auth, and connect routes
+_client_map: dict[str, Garmin] = {}
+_server_url: str = ""
+
+
+def _is_auth_error(e: Exception) -> bool:
+    """True when the exception means the Garmin session token is invalid/expired."""
+    if isinstance(e, GarminConnectAuthenticationError):
+        return True
+    if isinstance(e, GarminConnectConnectionError):
+        msg = str(e)
+        return "401" in msg or "403" in msg or "Unauthorized" in msg
+    return False
 
 
 class GarminClientProxy:
-    """Transparent proxy that dispatches attribute access to the per-request Garmin client."""
+    """Transparent proxy that routes Garmin API calls to the per-request client.
+
+    When no client is set (user not connected) it raises a RuntimeError with
+    the /connect URL so Claude can relay it to the user.  When a live call
+    returns an auth error the expired client is removed from _client_map and
+    the same helpful error is raised.
+    """
 
     def __getattr__(self, name: str):
         try:
             client = _active_client.get()
         except LookupError:
-            raise RuntimeError(
-                "No Garmin client is active for this request. "
-                "Check that MCP_USERS or GARMIN_EMAIL/PASSWORD are configured."
-            )
-        return getattr(client, name)
+            key = _active_user_key.get(None)
+            url = f"{_server_url}/connect?key={key}" if key and _server_url else "/connect"
+            raise RuntimeError(f"Not connected to Garmin. Please authenticate at: {url}")
+
+        attr = getattr(client, name)
+        if not callable(attr):
+            return attr
+
+        def _catching(*args, **kwargs):
+            try:
+                return attr(*args, **kwargs)
+            except Exception as e:
+                if _is_auth_error(e):
+                    key = _active_user_key.get(None)
+                    if key:
+                        _client_map.pop(key, None)
+                        print(f"connect: session expired ({key[:8]}…), removed from active clients.", file=sys.stderr)
+                    url = f"{_server_url}/connect?key={key}" if key and _server_url else "/connect"
+                    raise RuntimeError(f"Garmin session expired. Please reconnect at: {url}") from e
+                raise
+
+        return _catching
 
 
 # ---------------------------------------------------------------------------
@@ -92,120 +127,113 @@ def _user_tokenstore(base: str, email: str | None) -> str:
     return os.path.join(os.path.expanduser(base), safe)
 
 
+_GARMIN_TOKEN_FILE = "garmin_tokens.json"
+
+
 def _seed_tokens_if_missing(
     tokenstore: str,
-    oauth1_b64: str | None = None,
-    oauth2_b64: str | None = None,
+    garmin_tokens_b64: str | None = None,
 ) -> bool:
-    """Seed oauth token files to the volume.
+    """Seed garmin_tokens.json to the volume on first boot.
 
-    Per-user tokens (oauth1_b64/oauth2_b64 from MCP_USERS) are ALWAYS written —
+    Per-user tokens (garmin_tokens_b64 from MCP_USERS) are ALWAYS written —
     they represent an explicit configuration update and must take effect on restart.
 
-    Global env var fallbacks (GARMIN_OAUTH1_TOKEN / GARMIN_OAUTH2_TOKEN) are only
-    written if the file doesn't already exist, preserving any tokens garth has
-    refreshed and written to the volume during a prior run.
+    The global env var GARMIN_TOKENS (base64 of garmin_tokens.json) is only
+    written if the file doesn't already exist, preserving any tokens the library
+    has refreshed and written during a prior run.
 
-    Returns True if any token files exist on disk after seeding —
+    Returns True if garmin_tokens.json exists on disk after seeding —
     used by init_api to decide whether to skip email/password fallback.
     """
     import base64
 
-    token_map = {
-        "oauth1_token.json": (oauth1_b64, os.environ.get("GARMIN_OAUTH1_TOKEN", "").strip()),
-        "oauth2_token.json": (oauth2_b64, os.environ.get("GARMIN_OAUTH2_TOKEN", "").strip()),
-    }
-    for filename, (user_b64, env_b64) in token_map.items():
-        dest = os.path.join(tokenstore, filename)
-        if user_b64:
-            # Explicit per-user token — always overwrite so updates take effect
-            b64 = user_b64
-        elif os.path.exists(dest):
-            continue  # env var fallback, file already on volume — preserve it
-        elif env_b64:
-            b64 = env_b64  # first boot with global env var
-        else:
-            continue
-        try:
-            decoded = base64.b64decode(b64)
-            os.makedirs(tokenstore, exist_ok=True)
-            with open(dest, "wb") as f:
-                f.write(decoded)
-            src = "user config" if user_b64 else "env var (first boot)"
-            print(f"Token seed: wrote {filename} from {src}.", file=sys.stderr)
-        except Exception as e:
-            print(f"Token seed: failed to write {filename}: {e}", file=sys.stderr)
+    dest = os.path.join(tokenstore, _GARMIN_TOKEN_FILE)
+    env_b64 = os.environ.get("GARMIN_TOKENS", "").strip()
 
-    # Return True if any token files now exist — triggers no-password-fallback in init_api
-    return any(
-        os.path.exists(os.path.join(tokenstore, f))
-        for f in token_map
-    )
+    if garmin_tokens_b64:
+        b64 = garmin_tokens_b64  # explicit per-user token — always overwrite
+    elif os.path.exists(dest):
+        return True  # file already on volume — preserve it
+    elif env_b64:
+        b64 = env_b64  # first boot with global env var
+    else:
+        return False
+
+    try:
+        decoded = base64.b64decode(b64)
+        os.makedirs(tokenstore, exist_ok=True)
+        with open(dest, "wb") as f:
+            f.write(decoded)
+        src = "user config" if garmin_tokens_b64 else "env var (first boot)"
+        print(f"Token seed: wrote {_GARMIN_TOKEN_FILE} from {src}.", file=sys.stderr)
+    except Exception as e:
+        print(f"Token seed: failed to write {_GARMIN_TOKEN_FILE}: {e}", file=sys.stderr)
+
+    return os.path.exists(dest)
 
 
 def init_api(
     email: str | None,
     password: str | None,
     tokens_b64: str | None = None,
+    garmin_tokens_b64: str | None = None,
+    # Legacy garth-format fields — ignored, kept for call-site compat
     oauth1_b64: str | None = None,
     oauth2_b64: str | None = None,
 ) -> Garmin | None:
     """Initialize a Garmin client for one user.
 
     Priority:
-      1. tokens_b64 argument (passed in from MCP_USERS config)
+      1. tokens_b64 / garmin_tokens_b64 (base64 of garmin_tokens.json from MCP_USERS)
       2. GARMINTOKENS_BASE64_CONTENT env var (single-user hosted mode)
-      3. Token files on disk (per-user subdirectory under GARMINTOKENS path)
-         — seeded from per-user oauth1_b64/oauth2_b64 (or global env var fallbacks)
-         on first boot only; never overwritten on subsequent startups
-      4. email + password re-auth (only if no token files existed on the volume,
-         i.e. fresh setup — skipped when volume tokens are present to avoid 429s)
+      3. garmin_tokens.json on disk (per-user subdirectory under GARMINTOKENS path)
+         — seeded from garmin_tokens_b64 or GARMIN_TOKENS env var on first boot only
+      4. email + password re-auth (only if no token file existed on volume)
     """
+    import base64 as _b64mod
+
     is_cn = os.getenv("GARMIN_IS_CN", "false").lower() in ("true", "1", "yes")
     tokenstore_base = os.getenv("GARMINTOKENS") or "~/.garminconnect"
     tokenstore = _user_tokenstore(tokenstore_base, email)
 
-    # Seed token files only if they don't already exist on the volume.
-    # Returns True when files were pre-existing (skip email/password fallback).
-    had_volume_tokens = _seed_tokens_if_missing(tokenstore, oauth1_b64, oauth2_b64)
+    # Prefer the new field name; fall back to tokens_b64 for compat
+    tokens_b64_new = garmin_tokens_b64 or tokens_b64 or os.getenv("GARMINTOKENS_BASE64_CONTENT")
 
-    # 1. Inline base64 tokens (per-user from MCP_USERS, or single-user env var)
-    b64 = tokens_b64 or os.getenv("GARMINTOKENS_BASE64_CONTENT")
-    if b64:
+    # Seed garmin_tokens.json only if it doesn't already exist on the volume.
+    # Returns True when the file was pre-existing (skip email/password fallback).
+    had_volume_tokens = _seed_tokens_if_missing(tokenstore, garmin_tokens_b64)
+
+    # 1. Inline base64 garmin_tokens.json
+    if tokens_b64_new:
         try:
             print(f"Trying to login via base64 tokens (email={email})...", file=sys.stderr)
             garmin = Garmin(is_cn=is_cn)
-            garmin.garth.loads(b64.strip())
-            # Persist to per-user dir so future restarts skip re-auth
-            os.makedirs(tokenstore, exist_ok=True)
-            garmin.garth.dump(tokenstore)
+            garmin.client.loads(_b64mod.b64decode(tokens_b64_new.strip()).decode())
+            # Persist so future restarts load from disk
+            garmin.client.dump(tokenstore)
             print("Login successful via base64 tokens.", file=sys.stderr)
             return garmin
         except Exception as e:
             print(f"Base64 token load failed ({e}), falling back to file/credential auth.", file=sys.stderr)
 
-    # 2. Token files on disk (per-user directory)
+    # 2. garmin_tokens.json on disk
     try:
         print(f"Trying token files in '{tokenstore}' (email={email})...", file=sys.stderr)
-        old_stderr = sys.stderr
-        sys.stderr = io.StringIO()
-        try:
-            garmin = Garmin(is_cn=is_cn)
-            garmin.login(tokenstore)
-        finally:
-            sys.stderr = old_stderr
+        garmin = Garmin(is_cn=is_cn)
+        garmin.login(tokenstore)
         print("Login successful via token files.", file=sys.stderr)
         return garmin
-    except (FileNotFoundError, GarthHTTPError, GarminConnectAuthenticationError, GarminConnectConnectionError, GarminConnectTooManyRequestsError):
+    except (FileNotFoundError, GarminConnectAuthenticationError, GarminConnectConnectionError, GarminConnectTooManyRequestsError):
         pass
 
     # 3. Re-auth with email + password
-    # Skipped when volume tokens were present — avoids triggering Garmin's 429 rate limit.
-    # If volume tokens failed, update oauth1_token/oauth2_token in MCP_USERS and restart.
+    # Skipped when volume tokens were present — avoids Garmin's 429 rate limit.
+    # If volume tokens failed, update garmin_tokens in MCP_USERS and restart.
     if had_volume_tokens:
         print(
-            f"ERROR: Volume token files exist but auth failed for {email}. "
-            "Update oauth1_token/oauth2_token in MCP_USERS (or run garmin-mcp-auth) and restart.",
+            f"ERROR: Token file exists but auth failed for {email}. "
+            "Update garmin_tokens in MCP_USERS (or use /connect to re-authenticate) and restart.",
             file=sys.stderr,
         )
         return None
@@ -221,13 +249,16 @@ def init_api(
 
     print(f"Authenticating with Garmin Connect (email={email})...", file=sys.stderr)
     try:
-        garmin = Garmin(email=email, password=password, is_cn=is_cn, prompt_mfa=get_mfa)
-        garmin.login()
+        garmin = Garmin(email=email, password=password, is_cn=is_cn, return_on_mfa=True)
+        result1, result2 = garmin.login()
+        if result1 == "needs_mfa":
+            mfa_code = get_mfa()
+            garmin.resume_login(result2, mfa_code)
         os.makedirs(tokenstore, exist_ok=True)
-        garmin.garth.dump(tokenstore)
+        garmin.client.dump(tokenstore)
         print(f"Tokens saved to '{tokenstore}'.", file=sys.stderr)
         return garmin
-    except (FileNotFoundError, GarthHTTPError, GarminConnectAuthenticationError, GarminConnectConnectionError, requests.exceptions.HTTPError, requests.exceptions.RetryError) as err:
+    except (FileNotFoundError, GarminConnectAuthenticationError, GarminConnectConnectionError, requests.exceptions.HTTPError, requests.exceptions.RetryError) as err:
         error_msg = str(err)
         print(f"\nAuthentication failed: {error_msg.split(':')[0]}", file=sys.stderr)
         return None
@@ -238,27 +269,32 @@ def init_api(
 # ---------------------------------------------------------------------------
 
 def _load_users() -> list[dict] | None:
-    """Parse MCP_USERS env var (JSON array).
+    """Load users from the volume SQLite database.
 
-    Each entry: {"key": "...", "name": "...", "email": "...", "password": "...", "tokens_b64": "..."}
-    tokens_b64 is optional — omit if using email/password re-auth.
+    On first boot, seeds the DB from MCP_USERS env var if the table is empty
+    (backward-compat migration path). Once users are in the DB the env var is
+    no longer consulted.
 
-    Returns None if MCP_USERS is not set (fall back to single-user mode).
+    Returns None if the DB is empty (fall back to single-user mode).
     """
-    raw = os.environ.get("MCP_USERS")
-    if not raw:
-        return None
-    try:
-        users = json.loads(raw)
-        if not isinstance(users, list):
-            raise ValueError("MCP_USERS must be a JSON array")
-        for u in users:
-            if "key" not in u:
-                raise ValueError(f"Each user entry must have a 'key' field: {u}")
-        return users
-    except (json.JSONDecodeError, ValueError) as e:
-        print(f"ERROR: Failed to parse MCP_USERS: {e}", file=sys.stderr)
-        sys.exit(1)
+    import json
+    from garmin_mcp.users_db import init_db, list_users, seed_from_env_users
+
+    init_db()
+    users = list_users()
+    if not users:
+        # First boot: seed from MCP_USERS env var if set
+        raw = os.environ.get("MCP_USERS", "").strip()
+        if raw:
+            try:
+                env_users = json.loads(raw)
+                n = seed_from_env_users(env_users)
+                if n:
+                    print(f"DB: seeded {n} user(s) from MCP_USERS.", file=sys.stderr)
+                users = list_users()
+            except Exception as e:
+                print(f"DB: failed to seed from MCP_USERS: {e}", file=sys.stderr)
+    return users if users else None
 
 
 # ---------------------------------------------------------------------------
@@ -272,13 +308,16 @@ def _build_user_router(client_map: dict[str, Garmin], features_map: dict[str, di
     For unauthenticated paths (/health, OAuth endpoints) we skip routing.
     Also sets _active_user_features so per-user feature flags are available in tools.
     """
-    _UNAUTH_PREFIXES = ("/health", "/.well-known", "/authorize", "/token", "/register", "/revoke")
+    _UNAUTH_PREFIXES = (
+        "/health", "/.well-known", "/authorize", "/token",
+        "/register", "/revoke", "/connect",
+    )
 
     async def router(scope, receive, send):
         if scope["type"] == "http":
             path = scope.get("path", "")
 
-            # Pass through health + OAuth endpoints without requiring a client
+            # Pass through health, OAuth, and connect endpoints without a client
             if any(path.startswith(p) for p in _UNAUTH_PREFIXES):
                 await mcp_app(scope, receive, send)
                 return
@@ -292,14 +331,26 @@ def _build_user_router(client_map: dict[str, Garmin], features_map: dict[str, di
             if garmin_client is not None:
                 tok1 = _active_client.set(garmin_client)
                 tok2 = _active_user_features.set(features_map.get(bearer, {}))
+                tok3 = _active_user_key.set(bearer)
                 try:
                     await mcp_app(scope, receive, send)
                 finally:
                     _active_client.reset(tok1)
                     _active_user_features.reset(tok2)
+                    _active_user_key.reset(tok3)
             else:
-                # Let FastMCP's auth middleware handle the 401 response
-                await mcp_app(scope, receive, send)
+                # No Garmin client for this bearer token (not yet connected, or
+                # session expired and removed from client_map). Still set
+                # _active_user_key so the garmin_connection_status tool can report
+                # the reconnect URL even when the Garmin session is dead.
+                if bearer:
+                    tok3 = _active_user_key.set(bearer)
+                    try:
+                        await mcp_app(scope, receive, send)
+                    finally:
+                        _active_user_key.reset(tok3)
+                else:
+                    await mcp_app(scope, receive, send)
         else:
             await mcp_app(scope, receive, send)
 
@@ -362,6 +413,39 @@ def _configure_and_build_app(
         app = training_memory.register_tools(app)
 
     app = workout_templates.register_resources(app)
+
+    @app.tool()
+    async def garmin_connection_status() -> str:
+        """Check whether the Garmin account is currently connected to this server.
+
+        Call this whenever any Garmin tool returns an error — especially
+        'session expired' or 'not connected' errors. Returns the current
+        connection state and, if disconnected, a URL the user must visit
+        in their browser to re-link their Garmin account.
+        """
+        import json
+        key = _active_user_key.get(None)
+
+        if key is None:
+            # stdio / single-user mode — if we got here the client is connected
+            return json.dumps({"connected": True, "mode": "local"})
+
+        if key in _client_map:
+            return json.dumps({"connected": True})
+
+        reconnect_url = f"{_server_url}/connect?key={key}" if _server_url else None
+        return json.dumps({
+            "connected": False,
+            "reconnect_url": reconnect_url,
+            "message": (
+                "Your Garmin session has expired. "
+                "Ask the user to open the reconnect_url in their browser, "
+                "sign in with their Garmin credentials, and complete any "
+                "two-factor authentication prompt. Once done, Garmin tools "
+                "will work again without restarting Claude."
+            ),
+        })
+
     return app
 
 
@@ -403,9 +487,15 @@ def main():
             print("ERROR: MCP_SERVER_URL must be set in SSE mode (e.g. https://your-app.railway.app)", file=sys.stderr)
             sys.exit(1)
 
-        # Pre-populate all known API keys so OAuth flow works immediately at startup.
-        # Garmin clients are added to client_map as background auth completes.
-        client_map: dict[str, Garmin] = {}
+        global _server_url
+        _server_url = server_url
+
+        tokenstore_base = os.getenv("GARMINTOKENS") or "~/.garminconnect"
+
+        # Use the module-level _client_map so GarminClientProxy and connect routes share it.
+        _client_map.clear()
+        client_map = _client_map
+
         if users:
             known_keys = {u["key"] for u in users}
             # Per-user feature flags — keyed by API key for O(1) lookup in middleware.
@@ -424,39 +514,42 @@ def main():
 
         def _background_auth():
             import time
-            # Retry every 60 minutes — conservative to avoid extending Garmin's rate limit window
-            RETRY_INTERVAL = 3600
+            from garmin_mcp.connect import load_connect_meta
 
             if users:
-                while any(u["key"] not in client_map for u in users):
-                    pending = [u for u in users if u["key"] not in client_map]
-                    print(f"Background auth: attempting {len(pending)} user(s)...", file=sys.stderr)
-                    any_failed = False
-                    for u in pending:
-                        name = u.get("name", u["key"])
-                        client = init_api(
-                        u.get("email"), u.get("password"), u.get("tokens_b64"),
-                        oauth1_b64=u.get("oauth1_token"),
-                        oauth2_b64=u.get("oauth2_token"),
+                # Load the key→email map written by prior /connect sessions so we
+                # can find each user's token directory even if email is omitted from MCP_USERS.
+                connect_meta = load_connect_meta(tokenstore_base)
+                print(f"Background auth: loading tokens for {len(users)} user(s)...", file=sys.stderr)
+                for u in users:
+                    key = u["key"]
+                    name = u.get("name", key)
+                    # Resolve email: explicit in MCP_USERS → connect_meta from prior login → None
+                    email = u.get("email") or connect_meta.get(key, {}).get("email")
+                    client = init_api(
+                        email, u.get("password"), u.get("tokens_b64"),
+                        garmin_tokens_b64=u.get("garmin_tokens"),
                     )
-                        if client is None:
-                            print(f"  ✗ {name} — auth failed.", file=sys.stderr)
-                            any_failed = True
-                            continue
-                        client_map[u["key"]] = client
-                        print(f"  ✓ {name} ({u.get('email', 'no email')})", file=sys.stderr)
-                    if any_failed:
-                        print("Auth incomplete — retrying in 60 minutes.", file=sys.stderr)
-                        time.sleep(RETRY_INTERVAL)
+                    if client is None:
+                        print(
+                            f"  ✗ {name} — not connected. "
+                            f"Authenticate at: {server_url}/connect?key={key}",
+                            file=sys.stderr,
+                        )
+                    else:
+                        _client_map[key] = client
+                        print(f"  ✓ {name} ({email or 'no email'})", file=sys.stderr)
             else:
+                # Single-user fallback: keep retry loop (no connect UI for anon mode)
                 single_key = next(iter(known_keys))
                 single_email = os.environ.get("GARMIN_EMAIL")
                 single_password = os.environ.get("GARMIN_PASSWORD")
-                while single_key not in client_map:
+                RETRY_INTERVAL = 3600
+                while single_key not in _client_map:
                     print("Background auth: single-user mode...", file=sys.stderr)
                     client = init_api(single_email, single_password)
                     if client:
-                        client_map[single_key] = client
+                        _client_map[single_key] = client
                         print(f"Single-user authenticated. API key: {single_key}", file=sys.stderr)
                     else:
                         print("Auth failed — retrying in 60 minutes.", file=sys.stderr)
@@ -485,6 +578,10 @@ def main():
         form_handler = oauth_provider.make_form_handler()
         app.custom_route("/authorize-form", methods=["GET", "POST"])(form_handler)
 
+        # Garmin Connect web login flow
+        from garmin_mcp.connect import register_routes as _register_connect
+        _register_connect(app, _client_map, server_url, tokenstore_base)
+
         @app.custom_route("/health", methods=["GET"])
         async def health_check(request: Request) -> Response:
             return PlainTextResponse("ok")
@@ -496,13 +593,14 @@ def main():
                 user_status = [
                     {
                         "name": u.get("name", u["key"]),
-                        "authenticated": u["key"] in client_map,
+                        "authenticated": u["key"] in _client_map,
+                        "connect_url": f"{server_url}/connect?key={u['key']}",
                     }
                     for u in users
                 ]
             else:
                 single_key = next(iter(known_keys), None)
-                user_status = [{"name": "default", "authenticated": single_key in client_map}]
+                user_status = [{"name": "default", "authenticated": single_key in _client_map}]
             all_ready = all(u["authenticated"] for u in user_status)
             return JSONResponse({"ready": all_ready, "users": user_status})
 
