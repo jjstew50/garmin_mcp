@@ -293,6 +293,94 @@ def _build_user_router(client_map: dict[str, Garmin], features_map: dict[str, di
     return router
 
 
+def _build_signup_mode_router(oauth_provider, mcp_app):
+    """ASGI middleware for self-service signup mode.
+
+    On each MCP request:
+      1. Extract Bearer token (= user's API key)
+      2. Look up user in auth DB via SHA-256(api_key) — O(1), no argon2
+      3. Decrypt Garmin tokens with HKDF(api_key, per-user-salt) + AES-256-GCM
+      4. Init Garmin client from decrypted tokens (no network call — just JSON parse)
+      5. Set _active_client ContextVar for the duration of the request
+      6. After request: if garth refreshed its internal tokens, re-encrypt and persist
+      7. Record usage count
+
+    Security note: the server must decrypt tokens to make Garmin API calls, so the
+    operator can intercept plaintext at this point by modifying code. The design
+    protects tokens at rest (DB breach → worthless) but does not claim zero-knowledge.
+    """
+    from garmin_mcp import auth_db
+
+    _UNAUTH_PREFIXES = (
+        "/health", "/.well-known", "/authorize", "/token", "/register", "/revoke",
+        "/signup", "/connect-garmin", "/dashboard",
+    )
+
+    async def router(scope, receive, send):
+        if scope["type"] != "http":
+            await mcp_app(scope, receive, send)
+            return
+
+        path = scope.get("path", "")
+        if any(path.startswith(p) for p in _UNAUTH_PREFIXES):
+            await mcp_app(scope, receive, send)
+            return
+
+        headers = dict(scope.get("headers", []))
+        auth_header = headers.get(b"authorization", b"").decode()
+        bearer = auth_header[7:] if auth_header.startswith("Bearer ") else ""
+
+        if not bearer:
+            await mcp_app(scope, receive, send)
+            return
+
+        user = await auth_db.lookup_user_by_api_key(bearer)
+        if not user:
+            await mcp_app(scope, receive, send)
+            return
+
+        # Cache in the OAuth provider's verified set so load_access_token is instant
+        oauth_provider._verified_tokens.add(bearer)
+
+        if not user.get("garmin_connected"):
+            # Let the MCP layer respond; the user will get a tool-level error
+            await mcp_app(scope, receive, send)
+            return
+
+        garth_dump = await auth_db.load_garmin_tokens(user["id"], bearer)
+        if not garth_dump:
+            await mcp_app(scope, receive, send)
+            return
+
+        # Init Garmin client from the decrypted token dump (fast — just JSON parse)
+        garmin = Garmin(is_cn=os.getenv("GARMIN_IS_CN", "false").lower() in ("true", "1", "yes"))
+        garmin.garth.loads(garth_dump)
+
+        tok1 = _active_client.set(garmin)
+        tok2 = _active_user_features.set({})
+        try:
+            await mcp_app(scope, receive, send)
+        finally:
+            _active_client.reset(tok1)
+            _active_user_features.reset(tok2)
+
+            # Detect garth token refresh and re-encrypt if changed
+            try:
+                new_dump = garmin.garth.dumps()
+                if new_dump != garth_dump:
+                    await auth_db.store_garmin_tokens(user["id"], bearer, new_dump)
+            except Exception:
+                pass
+
+            # Record usage (fire-and-forget)
+            try:
+                await auth_db.record_usage(user["id"])
+            except Exception:
+                pass
+
+    return router
+
+
 # ---------------------------------------------------------------------------
 # App builder (shared between single-user and multi-user modes)
 # ---------------------------------------------------------------------------
@@ -390,6 +478,11 @@ def main():
             print("ERROR: MCP_SERVER_URL must be set in SSE mode (e.g. https://your-app.railway.app)", file=sys.stderr)
             sys.exit(1)
 
+        # SIGNUP_MODE=true enables self-service user registration + encrypted token storage.
+        # Users sign up at /signup, connect Garmin at /connect-garmin, then use the
+        # generated API key as the Bearer token in their MCP client config.
+        signup_mode = os.environ.get("SIGNUP_MODE", "false").lower() in ("true", "1", "yes")
+
         # Pre-populate all known API keys so OAuth flow works immediately at startup.
         # Garmin clients are added to client_map as background auth completes.
         client_map: dict[str, Garmin] = {}
@@ -407,6 +500,7 @@ def main():
         oauth_provider = GarminOAuthProvider(
             api_keys=known_keys,
             server_url=server_url,
+            signup_mode=signup_mode,
         )
 
         def _background_auth():
@@ -449,14 +543,20 @@ def main():
                         print("Auth failed — retrying in 60 minutes.", file=sys.stderr)
                         time.sleep(RETRY_INTERVAL)
 
-        import threading
-        threading.Thread(target=_background_auth, daemon=True).start()
+        # Background auth is only needed for MCP_USERS / static-key mode.
+        # In signup mode, Garmin clients are initialised per-request from encrypted DB.
+        if not signup_mode:
+            import threading
+            threading.Thread(target=_background_auth, daemon=True).start()
 
         auth_settings = AuthSettings(
             issuer_url=server_url,  # type: ignore[arg-type]
             resource_server_url=None,
             client_registration_options=ClientRegistrationOptions(enabled=True),
         )
+
+        if signup_mode:
+            print("SIGNUP_MODE enabled. Users can register at /signup and connect Garmin at /connect-garmin.", file=sys.stderr)
 
         # All modules share one proxy; the proxy routes to the right client per request
         proxy = GarminClientProxy()
@@ -472,6 +572,11 @@ def main():
         form_handler = oauth_provider.make_form_handler()
         app.custom_route("/authorize-form", methods=["GET", "POST"])(form_handler)
 
+        # Signup-mode: add self-service registration and Garmin connection routes
+        if signup_mode:
+            from garmin_mcp import signup as _signup_mod
+            _signup_mod.register_routes(app, server_url)
+
         @app.custom_route("/health", methods=["GET"])
         async def health_check(request: Request) -> Response:
             return PlainTextResponse("ok")
@@ -479,6 +584,16 @@ def main():
         @app.custom_route("/status", methods=["GET"])
         async def auth_status(request: Request) -> Response:
             from starlette.responses import JSONResponse
+            if signup_mode:
+                from garmin_mcp import auth_db as _auth_db
+                import aiosqlite
+                await _auth_db.ensure_db()
+                async with aiosqlite.connect(_auth_db._db_path()) as _db:
+                    async with _db.execute("SELECT COUNT(*) FROM users") as _cur:
+                        total = (await _cur.fetchone())[0]
+                    async with _db.execute("SELECT COUNT(*) FROM users WHERE garmin_connected=1") as _cur:
+                        connected = (await _cur.fetchone())[0]
+                return JSONResponse({"mode": "signup", "total_users": total, "garmin_connected": connected})
             if users:
                 user_status = [
                     {
@@ -495,8 +610,13 @@ def main():
 
         mcp_starlette = app.streamable_http_app()
 
-        # Outer ASGI wrapper: routes requests to the right Garmin client via ContextVar
-        asgi_app = _build_user_router(client_map, features_map, mcp_starlette)
+        # Outer ASGI wrapper: routes requests to the right Garmin client via ContextVar.
+        # Signup mode uses a dynamic per-request router (decrypt tokens on the fly).
+        # MCP_USERS / static-key mode uses the pre-built client_map.
+        if signup_mode:
+            asgi_app = _build_signup_mode_router(oauth_provider, mcp_starlette)
+        else:
+            asgi_app = _build_user_router(client_map, features_map, mcp_starlette)
 
         port = int(os.environ.get("PORT", 8000))
         config = uvicorn.Config(

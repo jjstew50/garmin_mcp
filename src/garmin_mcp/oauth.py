@@ -44,11 +44,15 @@ class GarminAuthCode(AuthorizationCode):
 # ---------------------------------------------------------------------------
 
 class GarminOAuthProvider(OAuthAuthorizationServerProvider[GarminAuthCode, RefreshToken, AccessToken]):
-    def __init__(self, api_keys: set[str], server_url: str):
+    def __init__(self, api_keys: set[str], server_url: str, signup_mode: bool = False):
         self._api_keys = api_keys
         self._server_url = server_url.rstrip("/")
+        self._signup_mode = signup_mode
         self._clients: dict[str, OAuthClientInformationFull] = {}
         self._auth_codes: dict[str, GarminAuthCode] = {}
+        # Fast in-memory cache of verified Bearer tokens (populated by ASGI middleware
+        # after successful DB lookup, so load_access_token stays O(1)).
+        self._verified_tokens: set[str] = set()
 
     async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
         return self._clients.get(client_id)
@@ -93,6 +97,8 @@ class GarminOAuthProvider(OAuthAuthorizationServerProvider[GarminAuthCode, Refre
     ) -> RefreshToken | None:
         if refresh_token in self._api_keys:
             return RefreshToken(token=refresh_token, client_id=client.client_id, scopes=[])
+        if self._signup_mode and refresh_token in self._verified_tokens:
+            return RefreshToken(token=refresh_token, client_id=client.client_id, scopes=[])
         return None
 
     async def exchange_refresh_token(
@@ -106,7 +112,12 @@ class GarminOAuthProvider(OAuthAuthorizationServerProvider[GarminAuthCode, Refre
         )
 
     async def load_access_token(self, token: str) -> AccessToken | None:
+        # Static MCP_USERS keys (always fast)
         if token in self._api_keys:
+            return AccessToken(token=token, client_id="garmin-user", scopes=[])
+        # Signup-mode: accept tokens that the ASGI middleware verified via auth_db.
+        # The middleware pre-populates _verified_tokens, keeping this path O(1).
+        if self._signup_mode and token in self._verified_tokens:
             return AccessToken(token=token, client_id="garmin-user", scopes=[])
         return None
 
@@ -134,10 +145,19 @@ class GarminOAuthProvider(OAuthAuthorizationServerProvider[GarminAuthCode, Refre
             except Exception:
                 return HTMLResponse("Invalid request", status_code=400)
 
-            if api_key not in provider._api_keys:
+            # In signup mode, verify against the auth DB as well as the static key set
+            key_valid = api_key in provider._api_keys
+            if not key_valid and provider._signup_mode:
+                from garmin_mcp import auth_db as _auth_db
+                user = await _auth_db.lookup_user_by_api_key(api_key)
+                if user:
+                    provider._verified_tokens.add(api_key)
+                    key_valid = True
+
+            if not key_valid:
                 from urllib.parse import quote
                 return RedirectResponse(
-                    f"/authorize-form?p={encoded}&error={quote('Invalid API key — check with Jason')}",
+                    f"/authorize-form?p={encoded}&error={quote('Invalid API key')}",
                     status_code=302,
                 )
 
