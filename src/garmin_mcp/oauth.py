@@ -339,9 +339,11 @@ input:focus{border-color:#0071e3}
 .note{font-size:12px;color:#999;text-align:center;margin-top:20px;line-height:1.6}
 </style>"""
 
+_FAVICON = '<link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,PHN2ZyBmaWxsPSIjMTg4MmQ0IiB2aWV3Qm94PSIwIDAgMjQgMjQiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+PHBhdGggZD0iTTIyLjAxNyAyMi42N0gxLjk4NGMtLjc3IDAtMS4zODgtLjM4My0xLjY5NC0xLjAwMi0uMzg3LS42MS0uMzg3LTEuMzkgMC0yLjAwMkwxMC4zMDQgMi4zM2MuMzg1LS42MTUgMS4wMDItMSAxLjY5NS0xIC43NyAwIDEuMzg2LjM4NSAxLjY5IDFsMTAuMDIgMTcuMzM2Yy4zODcuNjE3LjM4NyAxLjM5IDAgMi4wMDItLjMxLjY5NS0uOTI3IDEuMDAyLTEuNjkzIDEuMDAyeiIvPjwvc3ZnPg==">'
+
 _LOGIN_FORM_HTML = """<!DOCTYPE html><html lang="en">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Connect Garmin to Claude</title>""" + _CSS + """</head><body>
+<title>Connect Garmin to Claude</title>""" + _FAVICON + _CSS + """</head><body>
 <div class="card">
   <h1>🏃 Connect Garmin to Claude</h1>
   <p class="sub">Sign in with your Garmin Connect account to continue.</p>
@@ -361,7 +363,7 @@ _LOGIN_FORM_HTML = """<!DOCTYPE html><html lang="en">
 
 _MFA_FORM_HTML = """<!DOCTYPE html><html lang="en">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Two-Factor Auth</title>""" + _CSS + """</head><body>
+<title>Two-Factor Auth</title>""" + _FAVICON + _CSS + """</head><body>
 <div class="card">
   <h1>🔐 Two-Factor Authentication</h1>
   <p class="sub">Garmin sent a verification code to your email or phone.</p>
