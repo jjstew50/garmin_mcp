@@ -76,9 +76,9 @@ The workflows skip end-to-end (e2e) tests because they require valid Garmin cred
 Add these badges to your README.md:
 
 ```markdown
-![CI](https://github.com/YOUR_USERNAME/garmin_mcp/workflows/CI/badge.svg)
-![PR Validation](https://github.com/YOUR_USERNAME/garmin_mcp/workflows/PR%20Validation/badge.svg)
-![Security Checks](https://github.com/YOUR_USERNAME/garmin_mcp/workflows/Security%20Checks/badge.svg)
+![CI](https://github.com/jjstew50/garmin-mcp/workflows/CI/badge.svg)
+![PR Validation](https://github.com/jjstew50/garmin-mcp/workflows/PR%20Validation/badge.svg)
+![Security Checks](https://github.com/jjstew50/garmin-mcp/workflows/Security%20Checks/badge.svg)
 ```
 
 ## Troubleshooting

@@ -23,3 +23,4 @@ scratch/*
 tests/fixtures/captured/*
 !tests/fixtures/captured/poc_walk_run.json
 mcp_users.json
+data/
